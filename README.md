@@ -1,0 +1,193 @@
+# Agent Core
+
+Extensible agent orchestration framework with Gemini function calling support.
+
+## Installation
+
+### From another project (editable install)
+
+```bash
+pip install -e /path/to/LDIA/agent_core
+```
+
+Or in your `requirements.txt`:
+```
+-e /path/to/LDIA/agent_core
+```
+
+### Within LDIA
+
+Already configured as a local dependency in LDIA's `pyproject.toml`.
+
+## Quick Start
+
+```python
+from agent_core import Agent, EventType, emit_event
+
+class ResearcherAgent(Agent):
+    name = "researcher"
+    system_prompt = "You are a literature research assistant..."
+
+    # Optional: disable default events if you handle them yourself
+    # emit_lifecycle_events = False
+    # emit_tool_events = False
+
+    def __init__(self, session_id: str = None):
+        super().__init__(session_id=session_id)
+        self.register_tool(self.search_papers)
+        self.register_tool(self.read_paper)
+
+    def search_papers(self, query: str, max_results: int = 10) -> list[dict]:
+        """Search for research papers matching the query."""
+        # Your implementation
+        return [{"title": "...", "abstract": "..."}]
+
+    def read_paper(self, paper_id: str) -> dict:
+        """Read the full content of a paper."""
+        # Your implementation
+        return {"content": "..."}
+
+    # Optional: override hooks for custom behavior
+    def on_tool_start(self, tool_name: str, args: dict, tool_call_id: str):
+        print(f"Starting {tool_name}...")
+
+    def on_tool_end(self, tool_name: str, args: dict, tool_call_id: str,
+                    result, success: bool, error: str = None):
+        if success:
+            print(f"Completed {tool_name}")
+        else:
+            print(f"Failed {tool_name}: {error}")
+
+# Use the agent
+agent = ResearcherAgent()
+response = agent.run("Find papers about transformer architectures")
+```
+
+## Configuration
+
+### Class Attributes
+
+Override these in your agent subclass:
+
+| Attribute | Default | Description |
+|-----------|---------|-------------|
+| `name` | `"base"` | Agent type identifier |
+| `system_prompt` | `"You are a helpful assistant."` | System prompt |
+| `DEFAULT_MODEL` | `"gemini-3-pro-preview"` | Model to use |
+| `ROOT_AGENT_TYPES` | `{"designer", "analyst", "data_analyst"}` | Types that get deterministic IDs |
+| `CODE_TOOLS` | `{"execute_code", ...}` | Tools that handle code (special formatting) |
+| `MAX_PARALLEL_TOOLS` | `10` | Max concurrent tool executions |
+| `MAX_ITERATIONS` | `50` | Max function calling loop iterations |
+| `emit_lifecycle_events` | `True` | Emit AGENT_START/END events |
+| `emit_tool_events` | `True` | Emit TOOL_START/END events |
+
+### Lifecycle Hooks
+
+Override these methods for custom behavior:
+
+```python
+def on_agent_start(self, prompt: str) -> None:
+    """Called when agent starts processing."""
+
+def on_agent_end(self, result: str, success: bool, error: str = None) -> None:
+    """Called when agent finishes processing."""
+
+def on_tool_start(self, tool_name: str, args: dict, tool_call_id: str) -> None:
+    """Called before a tool executes."""
+
+def on_tool_end(self, tool_name: str, args: dict, tool_call_id: str,
+                result, success: bool, error: str = None) -> None:
+    """Called after a tool finishes."""
+
+def on_model_thinking(self, text: str) -> None:
+    """Called when model emits intermediate reasoning."""
+```
+
+## Persistence
+
+### No persistence (default without session_id)
+
+```python
+agent = MyAgent()  # In-memory history only
+```
+
+### SQLite persistence
+
+```python
+from agent_core.core.persistence import SQLiteConversationStore
+
+store = SQLiteConversationStore("~/.myapp/conversations.db")
+agent = MyAgent(session_id="session123", conversation_store=store)
+```
+
+### Custom persistence
+
+Implement the `ConversationStoreProtocol`:
+
+```python
+from agent_core.core.persistence import ConversationStoreProtocol
+
+class RedisConversationStore:
+    def load(self, session_id: str, agent_type: str) -> list:
+        # Load from Redis
+        ...
+
+    def save(self, session_id: str, agent_type: str, history: list) -> None:
+        # Save to Redis
+        ...
+
+    def clear(self, session_id: str, agent_type: str) -> None:
+        # Clear from Redis
+        ...
+
+store = RedisConversationStore()
+agent = MyAgent(session_id="session123", conversation_store=store)
+```
+
+## Events
+
+### Core Event Types
+
+| Event | Description |
+|-------|-------------|
+| `AGENT_START` | Agent begins processing |
+| `AGENT_END` | Agent finishes (success or failure) |
+| `TOOL_START` | Tool execution begins |
+| `TOOL_END` | Tool execution completes |
+| `MODEL_THINKING` | Intermediate reasoning text |
+| `CONTEXT_UPDATE` | Context window token count changed |
+| `ERROR` | Error occurred |
+
+### Subscribing to Events
+
+```python
+from agent_core import get_event_bus
+
+def my_handler(event):
+    print(f"{event.type}: {event.agent}")
+
+bus = get_event_bus()
+bus.subscribe(my_handler)
+```
+
+### Custom Event Types
+
+Use string values for custom events:
+
+```python
+from agent_core import emit_event
+
+emit_event(
+    "paper_downloaded",  # Custom event type as string
+    agent=self.instance_id,
+    agent_type=self.name,
+    details={"paper_id": "arxiv:1234", "size_mb": 5.2}
+)
+```
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GOOGLE_PROJECT_ID` | Yes | Google Cloud project ID |
+| `GOOGLE_LOCATION` | No | Vertex AI location (default: "global") |
