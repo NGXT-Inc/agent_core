@@ -24,6 +24,7 @@ from dotenv import find_dotenv, load_dotenv
 from google import genai
 from google.genai import types
 
+from agent_core.core.caching import CachePipeline
 from agent_core.core.events import EventType, EventStatus, emit_event
 from agent_core.core.persistence import ConversationStoreProtocol, InMemoryConversationStore
 
@@ -124,6 +125,10 @@ class Agent:
     MAX_PARALLEL_TOOLS: ClassVar[int] = 10
     MAX_ITERATIONS: ClassVar[int] = 50
 
+    # Context caching (pipelined, transparent)
+    ENABLE_CACHING: ClassVar[bool] = True
+    CACHE_MIN_TOKENS: ClassVar[int] = 32_768
+
     # Event emission flags (set False to handle events yourself)
     emit_lifecycle_events: ClassVar[bool] = True
     emit_tool_events: ClassVar[bool] = True
@@ -185,6 +190,20 @@ class Agent:
 
         # Wave ID for grouping parallel agents in visualization
         self._wave_id: str | None = None
+
+        # Context caching pipeline
+        if self.ENABLE_CACHING:
+            self._cache_pipeline = CachePipeline(
+                client=self.client,
+                model_name=self.model_name,
+                min_token_threshold=self.CACHE_MIN_TOKENS,
+            )
+            self._cache_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="cache"
+            )
+        else:
+            self._cache_pipeline = None
+            self._cache_executor = None
 
     # --- Lifecycle Hooks (override in subclasses) ---
 
@@ -399,6 +418,30 @@ class Agent:
         self._history = []
         if self._session_id and self._conversation_store:
             self._conversation_store.clear(self._session_id, self.name)
+        if self._cache_pipeline:
+            self._cache_pipeline.invalidate()
+
+    def _invalidate_cache(self) -> None:
+        """Invalidate the context cache.
+
+        Call after changing system_prompt or tools at runtime.
+        """
+        if self._cache_pipeline:
+            self._cache_pipeline.invalidate()
+
+    def close(self) -> None:
+        """Clean up agent resources (deletes remote caches, shuts down executor)."""
+        if self._cache_pipeline:
+            self._cache_pipeline.cleanup()
+        if self._cache_executor:
+            self._cache_executor.shutdown(wait=False)
+            self._cache_executor = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _save_history(self) -> None:
         """Save conversation history to persistent storage."""
@@ -667,8 +710,16 @@ class Agent:
         self,
         contents: list[types.Content],
         config: types.GenerateContentConfig,
+        contents_offset: int = 0,
     ) -> tuple[str, dict]:
-        """Run the model with manual function calling loop."""
+        """Run the model with manual function calling loop.
+
+        Args:
+            contents: Full conversation history (appended to during loop).
+            config: Generation config (may include cached_content).
+            contents_offset: Number of leading items covered by cache.
+                Only contents[contents_offset:] is sent to generate_content.
+        """
         iteration = 0
         total_prompt_tokens = 0
         total_completion_tokens = 0
@@ -678,7 +729,7 @@ class Agent:
 
             response = self.client.models.generate_content(
                 model=self.model_name,
-                contents=contents,
+                contents=contents[contents_offset:],
                 config=config,
             )
 
@@ -788,7 +839,7 @@ class Agent:
             )
 
         try:
-            config = types.GenerateContentConfig(
+            base_config = types.GenerateContentConfig(
                 system_instruction=self.system_prompt,
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
@@ -805,7 +856,47 @@ class Agent:
             self._history.append(user_content)
             self._save_history()
 
-            result, token_usage = self._run_with_function_loop(self._history, config)
+            # Use cached config if a ready cache exists
+            pipeline = self._cache_pipeline
+            if pipeline and pipeline.has_ready_cache:
+                cached_config = types.GenerateContentConfig(
+                    cached_content=pipeline.ready_cache_name,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    ),
+                )
+                try:
+                    result, token_usage = self._run_with_function_loop(
+                        self._history,
+                        cached_config,
+                        contents_offset=pipeline.cached_through_index,
+                    )
+                except Exception as cache_err:
+                    # Cache expired or invalid — fall back to uncached
+                    logger.warning(
+                        f"Cached generate_content failed, falling back: {cache_err}"
+                    )
+                    pipeline.invalidate()
+                    result, token_usage = self._run_with_function_loop(
+                        self._history, base_config
+                    )
+            else:
+                result, token_usage = self._run_with_function_loop(
+                    self._history, base_config
+                )
+
+            # Post-round cache pipeline: promote pending, fire new
+            if pipeline and self._cache_executor:
+                pipeline.promote_pending()
+                if pipeline.should_cache(self._history):
+                    pipeline.create_cache_async(
+                        contents=list(self._history),
+                        system_instruction=self.system_prompt,
+                        tools=self._tool_functions if self._tool_functions else None,
+                        executor=self._cache_executor,
+                    )
 
             # Call hook
             self.on_agent_end(result, success=True)
