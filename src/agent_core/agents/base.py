@@ -30,7 +30,7 @@ from agent_core.core.persistence import ConversationStoreProtocol, InMemoryConve
 load_dotenv(find_dotenv(usecwd=True))
 
 # Default model constants (can be overridden at class level)
-MODEL_PRO = "gemini-3-pro-preview"
+MODEL_PRO = "gemini-3.1-pro-preview"
 MODEL_FLASH = "gemini-3-flash-preview"
 
 # Environment configuration
@@ -146,16 +146,12 @@ class Agent:
                               is provided, uses InMemoryConversationStore.
         """
         if not GOOGLE_PROJECT_ID:
-            raise ValueError(
-                "GOOGLE_PROJECT_ID must be set in environment or .env file"
-            )
+            raise ValueError("GOOGLE_PROJECT_ID must be set in environment or .env file")
 
         self.model_name = model_name or self.DEFAULT_MODEL
 
         # Generate unique instance ID
-        self.instance_id = generate_instance_id(
-            self.name, session_id, self.ROOT_AGENT_TYPES
-        )
+        self.instance_id = generate_instance_id(self.name, session_id, self.ROOT_AGENT_TYPES)
 
         # Store session_id for persistence
         self._session_id: str | None = session_id
@@ -335,9 +331,16 @@ class Agent:
                 # For code tools, include full output details
                 if display_name in self.CODE_TOOLS and isinstance(result, dict):
                     code_result_keys = [
-                        "code", "stdout", "stderr", "success", "valid",
-                        "error", "rich_outputs", "defined_variables",
-                        "cell_index", "description",
+                        "code",
+                        "stdout",
+                        "stderr",
+                        "success",
+                        "valid",
+                        "error",
+                        "rich_outputs",
+                        "defined_variables",
+                        "cell_index",
+                        "description",
                     ]
                     for key in code_result_keys:
                         if key in result:
@@ -350,9 +353,7 @@ class Agent:
                     )
 
                 # Call hook
-                self.on_tool_end(
-                    display_name, kwargs, tool_call_id, result, success=True
-                )
+                self.on_tool_end(display_name, kwargs, tool_call_id, result, success=True)
 
                 # Emit event if enabled
                 if self.emit_tool_events:
@@ -482,18 +483,18 @@ class Agent:
                     parts_text.append(part.text)
                 elif hasattr(part, "function_call") and part.function_call:
                     fc = part.function_call
-                    parts_text.append(
-                        f"[Tool Call: {fc.name}({dict(fc.args) if fc.args else {}})]"
-                    )
+                    parts_text.append(f"[Tool Call: {fc.name}({dict(fc.args) if fc.args else {}})]")
                 elif hasattr(part, "function_response") and part.function_response:
                     fr = part.function_response
                     parts_text.append(f"[Tool Response: {fr.name} -> {fr.response}]")
 
             if parts_text:
-                history_formatted.append({
-                    "role": role,
-                    "content": "\n".join(parts_text),
-                })
+                history_formatted.append(
+                    {
+                        "role": role,
+                        "content": "\n".join(parts_text),
+                    }
+                )
 
         tool_names = list(self._tools.keys())
         context_tokens = self._count_context_tokens()
@@ -569,9 +570,7 @@ class Agent:
 
         return results
 
-    def _build_function_response_content(
-        self, results: list[tuple[str, Any]]
-    ) -> types.Content:
+    def _build_function_response_content(self, results: list[tuple[str, Any]]) -> types.Content:
         """Build a Content object with function response parts.
 
         Supports multimodal responses - if a tool result contains a "files"
@@ -627,9 +626,7 @@ class Agent:
                 if description:
                     label = "PDF" if mime_type == "application/pdf" else "File"
                     parts.append(
-                        types.Part.from_text(
-                            text=f"[{label} from {func_name}: {description}]"
-                        )
+                        types.Part.from_text(text=f"[{label} from {func_name}: {description}]")
                     )
 
                 # Check for GCS URI first (preferred for large files)
@@ -641,9 +638,7 @@ class Agent:
                             mime_type=mime_type,
                         )
                     )
-                    logger.debug(
-                        f"Attached GCS file to context: {gcs_uri} ({mime_type})"
-                    )
+                    logger.debug(f"Attached GCS file to context: {gcs_uri} ({mime_type})")
 
                 # Fall back to inline bytes
                 elif "data" in item:
@@ -793,9 +788,7 @@ class Agent:
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
                 tools=self._tool_functions if self._tool_functions else None,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True
-                ),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             )
 
             user_content = types.Content(
@@ -886,9 +879,7 @@ class Agent:
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
                 tools=self._tool_functions if self._tool_functions else None,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True
-                ),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             )
 
             contents = [
@@ -962,6 +953,7 @@ def agent_as_tool(agent: Agent, description: str | None = None) -> Callable:
         if context:
             try:
                 import json
+
                 ctx = json.loads(context)
             except json.JSONDecodeError:
                 ctx = {"raw_context": context}
