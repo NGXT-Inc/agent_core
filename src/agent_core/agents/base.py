@@ -740,12 +740,13 @@ class Agent:
                 total_completion_tokens += getattr(meta, "candidates_token_count", 0) or 0
                 cached = getattr(meta, "cached_content_token_count", 0) or 0
                 total_cached_tokens += cached
-                if cached:
-                    cache_label = "explicit" if contents_offset > 0 else "implicit"
-                    logger.debug(
-                        f"Cache hit ({cache_label}): {cached} cached / "
-                        f"{getattr(meta, 'prompt_token_count', 0)} prompt tokens"
-                    )
+                cache_label = "explicit" if contents_offset > 0 else "implicit"
+                pct = cached * 100 // max(last_prompt_token_count, 1) if cached else 0
+                logger.info(
+                    "[%s] iter=%d cache=%s: %d cached / %d prompt tokens (%d%%)",
+                    self.name, iteration, cache_label,
+                    cached, last_prompt_token_count, pct,
+                )
 
             token_usage = {
                 "prompt_tokens": total_prompt_tokens,
