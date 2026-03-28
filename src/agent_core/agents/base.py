@@ -739,8 +739,9 @@ class Agent:
                 cached = getattr(meta, "cached_content_token_count", 0) or 0
                 total_cached_tokens += cached
                 if cached:
+                    cache_label = "explicit" if contents_offset > 0 else "implicit"
                     logger.debug(
-                        f"Cache hit: {cached} cached / "
+                        f"Cache hit ({cache_label}): {cached} cached / "
                         f"{getattr(meta, 'prompt_token_count', 0)} prompt tokens"
                     )
 
@@ -749,6 +750,10 @@ class Agent:
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": total_prompt_tokens + total_completion_tokens,
                 "cached_tokens": total_cached_tokens,
+                "cache_type": (
+                    ("explicit" if contents_offset > 0 else "implicit")
+                    if total_cached_tokens else None
+                ),
             }
 
             if not response.candidates or not response.candidates[0].content:
@@ -830,6 +835,10 @@ class Agent:
             "completion_tokens": total_completion_tokens,
             "total_tokens": total_prompt_tokens + total_completion_tokens,
             "cached_tokens": total_cached_tokens,
+            "cache_type": (
+                ("explicit" if contents_offset > 0 else "implicit")
+                if total_cached_tokens else None
+            ),
         }
         return f"[Max iterations ({self.MAX_ITERATIONS}) reached]", token_usage
 
