@@ -187,8 +187,9 @@ class Agent:
         # Wave ID for grouping parallel agents in visualization
         self._wave_id: str | None = None
 
-        # Context caching pipeline
-        if self.ENABLE_CACHING:
+        # Context caching pipeline (only for persistent sessions —
+        # avoids overhead on short-lived sub-agents using run_stateless)
+        if self.ENABLE_CACHING and session_id:
             self._cache_pipeline = CachePipeline(
                 client=self.client,
                 model_name=self.model_name,
@@ -286,6 +287,8 @@ class Agent:
         wrapped = self._wrap_tool_with_events(func)
         self._tools[tool_name] = wrapped
         self._tool_functions.append(func)  # SDK needs unwrapped for declarations
+        if self._cache_pipeline:
+            self._cache_pipeline.invalidate()
 
     def _wrap_tool_with_events(self, func: Callable) -> Callable:
         """Wrap a tool function to emit events and call hooks."""
@@ -718,6 +721,7 @@ class Agent:
         iteration = 0
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        total_cached_tokens = 0
 
         while iteration < self.MAX_ITERATIONS:
             iteration += 1
@@ -732,11 +736,19 @@ class Agent:
                 meta = response.usage_metadata
                 total_prompt_tokens += getattr(meta, "prompt_token_count", 0) or 0
                 total_completion_tokens += getattr(meta, "candidates_token_count", 0) or 0
+                cached = getattr(meta, "cached_content_token_count", 0) or 0
+                total_cached_tokens += cached
+                if cached:
+                    logger.debug(
+                        f"Cache hit: {cached} cached / "
+                        f"{getattr(meta, 'prompt_token_count', 0)} prompt tokens"
+                    )
 
             token_usage = {
                 "prompt_tokens": total_prompt_tokens,
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": total_prompt_tokens + total_completion_tokens,
+                "cached_tokens": total_cached_tokens,
             }
 
             if not response.candidates or not response.candidates[0].content:
@@ -784,6 +796,23 @@ class Agent:
             contents.append(function_response_content)
             self._save_history()
 
+            # Mid-loop: promote pending cache for cheaper subsequent iterations
+            pipeline = self._cache_pipeline
+            if pipeline and pipeline.promote_pending():
+                if pipeline.is_config_valid(self.system_prompt, self._tool_functions):
+                    contents_offset = pipeline.cached_through_index
+                    config = types.GenerateContentConfig(
+                        cached_content=pipeline.ready_cache_name,
+                        temperature=config.temperature,
+                        max_output_tokens=config.max_output_tokens,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        ),
+                    )
+                    logger.debug(f"Mid-loop cache switch: offset={contents_offset}")
+                else:
+                    pipeline.invalidate()
+
             # Emit context update
             if self.emit_lifecycle_events:
                 context_tokens = self._count_context_tokens()
@@ -800,6 +829,7 @@ class Agent:
             "prompt_tokens": total_prompt_tokens,
             "completion_tokens": total_completion_tokens,
             "total_tokens": total_prompt_tokens + total_completion_tokens,
+            "cached_tokens": total_cached_tokens,
         }
         return f"[Max iterations ({self.MAX_ITERATIONS}) reached]", token_usage
 
@@ -849,8 +879,13 @@ class Agent:
             self._history.append(user_content)
             self._save_history()
 
-            # Use cached config if a ready cache exists
+            # Validate cache config hasn't drifted (system_prompt or tools changed)
             pipeline = self._cache_pipeline
+            if pipeline and pipeline.has_ready_cache:
+                if not pipeline.is_config_valid(self.system_prompt, self._tool_functions):
+                    logger.warning("Cache invalidated: system_prompt or tools changed")
+                    pipeline.invalidate()
+
             if pipeline and pipeline.has_ready_cache:
                 cached_config = types.GenerateContentConfig(
                     cached_content=pipeline.ready_cache_name,

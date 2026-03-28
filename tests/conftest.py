@@ -76,9 +76,10 @@ class MockCandidate:
 class MockUsageMetadata:
     """Mock for response usage metadata."""
 
-    def __init__(self, prompt_token_count: int = 100, candidates_token_count: int = 50):
+    def __init__(self, prompt_token_count: int = 100, candidates_token_count: int = 50, cached_content_token_count: int = 0):
         self.prompt_token_count = prompt_token_count
         self.candidates_token_count = candidates_token_count
+        self.cached_content_token_count = cached_content_token_count
 
 
 class MockTokenCountResponse:

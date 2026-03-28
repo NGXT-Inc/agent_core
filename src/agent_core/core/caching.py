@@ -10,6 +10,7 @@ This module is internal to agent_core. Developers using the package
 do not interact with it directly.
 """
 
+import hashlib
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable
@@ -18,6 +19,10 @@ from google import genai
 from google.genai import types
 
 logger = logging.getLogger(__name__)
+
+# Minimum new history items before considering a new cache creation.
+# Avoids redundant cache creates when history barely changed.
+MIN_HISTORY_GROWTH = 4
 
 
 class CachePipeline:
@@ -46,6 +51,12 @@ class CachePipeline:
         self._pending_through_index: int | None = None
         self._cached_through_index: int = 0
 
+        # Track history length at last cache creation to avoid redundant creates
+        self._last_cache_history_len: int = 0
+
+        # Config fingerprint to detect system_prompt/tools changes
+        self._config_fingerprint: str | None = None
+
     @property
     def has_ready_cache(self) -> bool:
         return self._ready_name is not None
@@ -58,8 +69,38 @@ class CachePipeline:
     def cached_through_index(self) -> int:
         return self._cached_through_index
 
+    @staticmethod
+    def _compute_fingerprint(
+        system_instruction: str | None, tools: list[Callable] | None
+    ) -> str:
+        """Hash system_instruction + tool names to detect config drift."""
+        parts = [system_instruction or ""]
+        if tools:
+            parts.extend(getattr(f, "__name__", str(f)) for f in tools)
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+    def is_config_valid(
+        self, system_instruction: str | None, tools: list[Callable] | None
+    ) -> bool:
+        """Check if current cache matches the given system_instruction and tools."""
+        if self._config_fingerprint is None:
+            return True
+        return self._compute_fingerprint(system_instruction, tools) == self._config_fingerprint
+
     def should_cache(self, contents: list[types.Content]) -> bool:
-        """Check if contents exceed the minimum token threshold for caching."""
+        """Check if contents exceed the minimum token threshold for caching.
+
+        Skips the (expensive) count_tokens API call when a creation is
+        already pending or when history hasn't grown enough since the
+        last cache was fired.
+        """
+        if self._pending is not None:
+            return False
+        if (
+            self._last_cache_history_len > 0
+            and len(contents) - self._last_cache_history_len < MIN_HISTORY_GROWTH
+        ):
+            return False
         try:
             response = self._client.models.count_tokens(
                 model=self._model_name,
@@ -95,6 +136,8 @@ class CachePipeline:
             return
 
         self._pending_through_index = len(contents)
+        self._last_cache_history_len = len(contents)
+        self._config_fingerprint = self._compute_fingerprint(system_instruction, tools)
 
         def _create() -> str:
             cache = self._client.caches.create(
@@ -110,20 +153,24 @@ class CachePipeline:
 
         self._pending = executor.submit(_create)
 
-    def promote_pending(self) -> None:
-        """Wait for pending cache to complete, promote it to ready.
+    def promote_pending(self) -> bool:
+        """Promote pending cache to ready if complete (non-blocking).
 
-        Deletes the old ready cache. On failure, clears pending and
-        leaves ready unchanged.
+        Returns True if a new cache was successfully promoted.
+        Deletes the old ready cache on promotion.
         """
         if self._pending is None:
-            return
+            return False
+        if not self._pending.done():
+            return False
 
         old_name = self._ready_name
+        promoted = False
         try:
-            new_name = self._pending.result(timeout=120)
+            new_name = self._pending.result(timeout=0)
             self._ready_name = new_name
             self._cached_through_index = self._pending_through_index or 0
+            promoted = True
             logger.debug(
                 f"Cache promoted: {new_name} "
                 f"(covers {self._cached_through_index} history items)"
@@ -137,11 +184,26 @@ class CachePipeline:
         if old_name:
             self._delete_cache(old_name)
 
+        return promoted
+
     def invalidate(self) -> None:
-        """Clear all cache state. Called on history clear or prompt change."""
+        """Clear all cache state. Called on history clear or config change."""
         old_name = self._ready_name
         self._ready_name = None
         self._cached_through_index = 0
+        self._last_cache_history_len = 0
+        self._config_fingerprint = None
+
+        # Clean up pending future instead of orphaning it
+        if self._pending is not None:
+            if self._pending.done():
+                try:
+                    name = self._pending.result(timeout=0)
+                    self._delete_cache(name)
+                except Exception:
+                    pass
+            else:
+                self._pending.cancel()
         self._pending = None
         self._pending_through_index = None
 
@@ -172,3 +234,5 @@ class CachePipeline:
 
         self._cached_through_index = 0
         self._pending_through_index = None
+        self._last_cache_history_len = 0
+        self._config_fingerprint = None

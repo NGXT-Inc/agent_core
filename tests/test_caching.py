@@ -421,7 +421,7 @@ class TestAgentCachingIntegration:
         # Below threshold initially
         mock_client.models.count_tokens.return_value = MockTokenCountResponse(1000)
 
-        agent = Agent()
+        agent = Agent(session_id="test-session")
         yield agent, mock_client
         agent.close()
 
@@ -445,14 +445,14 @@ class TestAgentCachingIntegration:
         agent.close()
 
     def test_caching_enabled_by_default(self, mock_env, mock_genai):
-        """Agent should have caching enabled by default."""
+        """Agent should have caching enabled by default when session_id is set."""
         from agent_core.agents.base import Agent
 
         mock_genai.Client.return_value.models.generate_content.return_value = (
             make_text_response("ok")
         )
 
-        agent = Agent()
+        agent = Agent(session_id="test-session")
         assert agent._cache_pipeline is not None
         assert agent._cache_executor is not None
         agent.close()
@@ -489,7 +489,7 @@ class TestAgentCachingIntegration:
         cache_name = "cachedContents/test-123"
         mock_client.caches.create.return_value = MockCachedContent(cache_name)
 
-        agent = Agent()
+        agent = Agent(session_id="test-session")
 
         # Round 1: no cache yet, fires cache creation
         agent.run("first message")
@@ -546,7 +546,7 @@ class TestAgentCachingIntegration:
         mock_client = mock_genai.Client.return_value
         mock_client.models.generate_content.return_value = make_text_response("ok")
 
-        agent = Agent()
+        agent = Agent(session_id="test-session")
         pipeline = agent._cache_pipeline
         executor = agent._cache_executor
 
@@ -574,7 +574,7 @@ class TestAgentCachingIntegration:
 
         mock_client.models.generate_content.side_effect = generate_side_effect
 
-        agent = Agent()
+        agent = Agent(session_id="test-session")
 
         # Manually set up a ready cache to trigger cached path
         agent._cache_pipeline._ready_name = "cachedContents/stale"
@@ -597,7 +597,7 @@ class TestAgentCachingIntegration:
         mock_client.models.generate_content.return_value = make_text_response("stateless")
         mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
 
-        agent = Agent()
+        agent = Agent(session_id="test-session")
 
         agent.run_stateless("one-shot query")
 
@@ -639,7 +639,7 @@ class TestContentsOffset:
         mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
         mock_client.caches.create.return_value = MockCachedContent("cachedContents/c1")
 
-        agent = Agent()
+        agent = Agent(session_id="test-session")
 
         # Round 1
         agent.run("first")
