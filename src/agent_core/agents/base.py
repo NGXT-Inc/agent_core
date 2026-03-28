@@ -757,6 +757,7 @@ class Agent:
                     if total_cached_tokens else None
                 ),
                 "last_prompt_token_count": last_prompt_token_count,
+                "model": self.model_name,
             }
 
             if not response.candidates or not response.candidates[0].content:
@@ -838,6 +839,7 @@ class Agent:
             "completion_tokens": total_completion_tokens,
             "total_tokens": total_prompt_tokens + total_completion_tokens,
             "cached_tokens": total_cached_tokens,
+            "model": self.model_name,
             "cache_type": (
                 ("explicit" if contents_offset > 0 else "implicit")
                 if total_cached_tokens else None
