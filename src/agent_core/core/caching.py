@@ -87,12 +87,23 @@ class CachePipeline:
             return True
         return self._compute_fingerprint(system_instruction, tools) == self._config_fingerprint
 
-    def should_cache(self, contents: list[types.Content]) -> bool:
+    def should_cache(
+        self,
+        contents: list[types.Content],
+        last_prompt_token_count: int | None = None,
+    ) -> bool:
         """Check if contents exceed the minimum token threshold for caching.
 
         Skips the (expensive) count_tokens API call when a creation is
-        already pending or when history hasn't grown enough since the
-        last cache was fired.
+        already pending, when history hasn't grown enough since the
+        last cache was fired, or when the caller already knows the
+        token count from the most recent generate_content response.
+
+        Args:
+            contents: Conversation history to potentially cache.
+            last_prompt_token_count: Token count from the last API response's
+                usage_metadata.prompt_token_count. If provided and above
+                threshold, skips the count_tokens API call.
         """
         if self._pending is not None:
             return False
@@ -101,6 +112,15 @@ class CachePipeline:
             and len(contents) - self._last_cache_history_len < MIN_HISTORY_GROWTH
         ):
             return False
+
+        # Use known count from generate_content response if available
+        if last_prompt_token_count is not None:
+            logger.debug(
+                f"Cache token check (from response): {last_prompt_token_count} tokens "
+                f"(threshold: {self._min_token_threshold})"
+            )
+            return last_prompt_token_count >= self._min_token_threshold
+
         try:
             response = self._client.models.count_tokens(
                 model=self._model_name,

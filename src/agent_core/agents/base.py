@@ -722,6 +722,7 @@ class Agent:
         total_prompt_tokens = 0
         total_completion_tokens = 0
         total_cached_tokens = 0
+        last_prompt_token_count = 0
 
         while iteration < self.MAX_ITERATIONS:
             iteration += 1
@@ -734,7 +735,8 @@ class Agent:
 
             if hasattr(response, "usage_metadata") and response.usage_metadata:
                 meta = response.usage_metadata
-                total_prompt_tokens += getattr(meta, "prompt_token_count", 0) or 0
+                last_prompt_token_count = getattr(meta, "prompt_token_count", 0) or 0
+                total_prompt_tokens += last_prompt_token_count
                 total_completion_tokens += getattr(meta, "candidates_token_count", 0) or 0
                 cached = getattr(meta, "cached_content_token_count", 0) or 0
                 total_cached_tokens += cached
@@ -754,6 +756,7 @@ class Agent:
                     ("explicit" if contents_offset > 0 else "implicit")
                     if total_cached_tokens else None
                 ),
+                "last_prompt_token_count": last_prompt_token_count,
             }
 
             if not response.candidates or not response.candidates[0].content:
@@ -839,6 +842,7 @@ class Agent:
                 ("explicit" if contents_offset > 0 else "implicit")
                 if total_cached_tokens else None
             ),
+            "last_prompt_token_count": last_prompt_token_count,
         }
         return f"[Max iterations ({self.MAX_ITERATIONS}) reached]", token_usage
 
@@ -927,7 +931,10 @@ class Agent:
             # Post-round cache pipeline: promote pending, fire new
             if pipeline and self._cache_executor:
                 pipeline.promote_pending()
-                if pipeline.should_cache(self._history):
+                if pipeline.should_cache(
+                    self._history,
+                    last_prompt_token_count=token_usage.get("last_prompt_token_count"),
+                ):
                     pipeline.create_cache_async(
                         contents=list(self._history),
                         system_instruction=self.system_prompt,

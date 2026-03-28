@@ -15,7 +15,9 @@ from tests.conftest import (
     MockCachedContent,
     MockContent,
     MockPart,
+    MockResponse,
     MockTokenCountResponse,
+    MockUsageMetadata,
     make_text_response,
     make_tool_call_response,
 )
@@ -83,6 +85,23 @@ class TestShouldCache:
         pipeline = CachePipeline(mock_client, "test-model", min_token_threshold=32_768)
 
         assert pipeline.should_cache([]) is True
+
+    def test_known_token_count_skips_api_call(self):
+        """When last_prompt_token_count is provided, count_tokens API is skipped."""
+        from agent_core.core.caching import CachePipeline
+
+        mock_client = MagicMock()
+        pipeline = CachePipeline(mock_client, "test-model", min_token_threshold=32_768)
+
+        contents = [MockContent(role="user", parts=[MockPart(text="hello")])]
+
+        # Above threshold via known count
+        assert pipeline.should_cache(contents, last_prompt_token_count=50_000) is True
+        mock_client.models.count_tokens.assert_not_called()
+
+        # Below threshold via known count
+        assert pipeline.should_cache(contents, last_prompt_token_count=1_000) is False
+        mock_client.models.count_tokens.assert_not_called()
 
     def test_count_tokens_failure_returns_false(self):
         """If count_tokens API fails, should_cache returns False gracefully."""
@@ -470,8 +489,12 @@ class TestAgentCachingIntegration:
     def test_cache_created_above_threshold(self, agent_with_caching):
         """When content exceeds threshold after run, cache should be fired."""
         agent, mock_client = agent_with_caching
-        # Above threshold
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
+        # Response reports prompt tokens above threshold — should_cache uses this
+        mock_client.models.generate_content.return_value = MockResponse(
+            "Hello!",
+            MockContent(role="model", parts=[MockPart(text="Hello!")]),
+            usage_metadata=MockUsageMetadata(prompt_token_count=50_000),
+        )
 
         agent.run("large prompt with lots of context")
 
@@ -483,8 +506,12 @@ class TestAgentCachingIntegration:
         from agent_core.agents.base import Agent
 
         mock_client = mock_genai.Client.return_value
-        mock_client.models.generate_content.return_value = make_text_response("response")
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
+        # Response reports prompt tokens above threshold so should_cache triggers
+        mock_client.models.generate_content.return_value = MockResponse(
+            "response",
+            MockContent(role="model", parts=[MockPart(text="response")]),
+            usage_metadata=MockUsageMetadata(prompt_token_count=50_000),
+        )
 
         cache_name = "cachedContents/test-123"
         mock_client.caches.create.return_value = MockCachedContent(cache_name)
@@ -635,8 +662,12 @@ class TestContentsOffset:
         from agent_core.agents.base import Agent
 
         mock_client = mock_genai.Client.return_value
-        mock_client.models.generate_content.return_value = make_text_response("ok")
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
+        # Response reports prompt tokens above threshold so should_cache triggers
+        mock_client.models.generate_content.return_value = MockResponse(
+            "ok",
+            MockContent(role="model", parts=[MockPart(text="ok")]),
+            usage_metadata=MockUsageMetadata(prompt_token_count=50_000),
+        )
         mock_client.caches.create.return_value = MockCachedContent("cachedContents/c1")
 
         agent = Agent(session_id="test-session")
