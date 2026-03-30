@@ -14,6 +14,7 @@ This module is designed to be extended without modification:
 import functools
 import logging
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, ClassVar
@@ -702,6 +703,34 @@ class Agent:
 
         return types.Content(role="user", parts=parts)
 
+    # --- Retry Logic ---
+
+    # Retry config for quota-exhausted (429) errors
+    RETRY_MAX_ATTEMPTS: ClassVar[int] = 5
+    RETRY_BASE_DELAY: ClassVar[float] = 2.0   # seconds
+    RETRY_MAX_DELAY: ClassVar[float] = 60.0    # seconds
+
+    def _generate_with_retry(self, **kwargs):
+        """Call generate_content with exponential backoff on 429 errors."""
+        from google.genai.errors import ClientError
+
+        for attempt in range(1, self.RETRY_MAX_ATTEMPTS + 1):
+            try:
+                return self.client.models.generate_content(**kwargs)
+            except ClientError as e:
+                if e.code == 429 and attempt < self.RETRY_MAX_ATTEMPTS:
+                    delay = min(
+                        self.RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+                        self.RETRY_MAX_DELAY,
+                    )
+                    logger.warning(
+                        "[%s] 429 quota exhausted (attempt %d/%d), retrying in %.1fs",
+                        self.name, attempt, self.RETRY_MAX_ATTEMPTS, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
+
     # --- Main Execution Loop ---
 
     def _run_with_function_loop(
@@ -727,7 +756,7 @@ class Agent:
         while iteration < self.MAX_ITERATIONS:
             iteration += 1
 
-            response = self.client.models.generate_content(
+            response = self._generate_with_retry(
                 model=self.model_name,
                 contents=contents[contents_offset:],
                 config=config,
