@@ -188,16 +188,15 @@ def mock_events():
 
 
 @pytest.fixture
-def mock_cache_pipeline():
-    """Mock the CachePipeline to isolate Agent tests from caching logic."""
-    with patch("agent_core.agents.base.CachePipeline") as mock_cls:
-        mock_pipeline = MagicMock()
-        mock_pipeline.has_ready_cache = False
-        mock_pipeline.ready_cache_name = None
-        mock_pipeline.cached_through_index = 0
-        mock_pipeline.should_cache.return_value = False
-        mock_cls.return_value = mock_pipeline
-        yield mock_pipeline
+def mock_cache_registry():
+    """Mock the ContextCacheRegistry to isolate Agent tests from caching logic."""
+    from agent_core.core.caching import CacheAdvice
+
+    with patch("agent_core.agents.base.ContextCacheRegistry") as mock_cls:
+        mock_reg = MagicMock()
+        mock_reg.get_advice.return_value = CacheAdvice(cache_name=None, contents_offset=0)
+        mock_cls.return_value = mock_reg
+        yield mock_reg
 
 
 @pytest.fixture

@@ -25,7 +25,7 @@ from dotenv import find_dotenv, load_dotenv
 from google import genai
 from google.genai import types
 
-from agent_core.core.caching import CachePipeline
+from agent_core.core.caching import ContextCacheRegistry
 from agent_core.core.events import EventType, EventStatus, emit_event
 from agent_core.core.persistence import ConversationStoreProtocol, InMemoryConversationStore
 
@@ -126,13 +126,37 @@ class Agent:
     MAX_PARALLEL_TOOLS: ClassVar[int] = 10
     MAX_ITERATIONS: ClassVar[int] = 50
 
-    # Context caching (pipelined, transparent)
+    # Context caching
     ENABLE_CACHING: ClassVar[bool] = True
     CACHE_MIN_TOKENS: ClassVar[int] = 32_768
+
+    # Shared cache registry (initialized once at app startup)
+    _cache_registry: ClassVar[ContextCacheRegistry | None] = None
 
     # Event emission flags (set False to handle events yourself)
     emit_lifecycle_events: ClassVar[bool] = True
     emit_tool_events: ClassVar[bool] = True
+
+    @classmethod
+    def init_cache_registry(
+        cls,
+        client: genai.Client,
+        max_workers: int = 4,
+        cache_ttl_seconds: int = 600,
+    ) -> None:
+        """Initialize the shared cache registry. Call once at app startup."""
+        if cls._cache_registry is not None:
+            cls._cache_registry.close()
+        cls._cache_registry = ContextCacheRegistry(
+            client, max_workers, cache_ttl_seconds
+        )
+
+    @classmethod
+    def shutdown_cache_registry(cls) -> None:
+        """Shutdown the shared cache registry. Call once at app teardown."""
+        if cls._cache_registry:
+            cls._cache_registry.close()
+            cls._cache_registry = None
 
     def __init__(
         self,
@@ -188,20 +212,17 @@ class Agent:
         # Wave ID for grouping parallel agents in visualization
         self._wave_id: str | None = None
 
-        # Context caching pipeline (only for persistent sessions —
+        # Register with shared cache registry (only for persistent sessions —
         # avoids overhead on short-lived sub-agents using run_stateless)
-        if self.ENABLE_CACHING and session_id:
-            self._cache_pipeline = CachePipeline(
-                client=self.client,
+        if self.ENABLE_CACHING and session_id and self._cache_registry:
+            self._cache_registry.register(
+                agent_id=self.instance_id,
                 model_name=self.model_name,
                 min_token_threshold=self.CACHE_MIN_TOKENS,
             )
-            self._cache_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="cache"
-            )
+            self._cache_enabled = True
         else:
-            self._cache_pipeline = None
-            self._cache_executor = None
+            self._cache_enabled = False
 
     # --- Lifecycle Hooks (override in subclasses) ---
 
@@ -288,8 +309,8 @@ class Agent:
         wrapped = self._wrap_tool_with_events(func)
         self._tools[tool_name] = wrapped
         self._tool_functions.append(func)  # SDK needs unwrapped for declarations
-        if self._cache_pipeline:
-            self._cache_pipeline.invalidate()
+        if self._cache_enabled:
+            self._cache_registry.invalidate(self.instance_id)
 
     def _wrap_tool_with_events(self, func: Callable) -> Callable:
         """Wrap a tool function to emit events and call hooks."""
@@ -423,24 +444,22 @@ class Agent:
         self._history = []
         if self._session_id and self._conversation_store:
             self._conversation_store.clear(self._session_id, self.name)
-        if self._cache_pipeline:
-            self._cache_pipeline.invalidate()
+        if self._cache_enabled:
+            self._cache_registry.invalidate(self.instance_id)
 
     def _invalidate_cache(self) -> None:
         """Invalidate the context cache.
 
         Call after changing system_prompt or tools at runtime.
         """
-        if self._cache_pipeline:
-            self._cache_pipeline.invalidate()
+        if self._cache_enabled:
+            self._cache_registry.invalidate(self.instance_id)
 
     def close(self) -> None:
-        """Clean up agent resources (deletes remote caches, shuts down executor)."""
-        if self._cache_pipeline:
-            self._cache_pipeline.cleanup()
-        if self._cache_executor:
-            self._cache_executor.shutdown(wait=False)
-            self._cache_executor = None
+        """Clean up agent resources (unregisters from cache registry)."""
+        if self._cache_enabled:
+            self._cache_registry.unregister(self.instance_id)
+            self._cache_enabled = False
 
     def __del__(self):
         try:
@@ -835,33 +854,35 @@ class Agent:
             contents.append(function_response_content)
             self._save_history()
 
-            # Mid-loop: promote pending cache for cheaper subsequent iterations
-            pipeline = self._cache_pipeline
-            if pipeline and pipeline.promote_pending():
-                if pipeline.is_config_valid(self.system_prompt, self._tool_functions):
-                    contents_offset = pipeline.cached_through_index
-                    config = types.GenerateContentConfig(
-                        cached_content=pipeline.ready_cache_name,
-                        temperature=config.temperature,
-                        max_output_tokens=config.max_output_tokens,
-                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                            disable=True
-                        ),
+            # Mid-loop: notify registry (may fire new cache) and re-query
+            if self._cache_enabled:
+                self._cache_registry.notify(
+                    self.instance_id,
+                    contents,
+                    self.system_prompt,
+                    self._tool_functions or None,
+                    token_count=last_prompt_token_count,
+                )
+                advice = self._cache_registry.get_advice(
+                    self.instance_id, self.system_prompt, self._tool_functions
+                )
+                if advice.cache_name:
+                    contents_offset = advice.contents_offset
+                    config = self._cached_config(
+                        advice.cache_name, config.temperature, config.max_output_tokens
                     )
-                    logger.debug(f"Mid-loop cache switch: offset={contents_offset}")
-                else:
-                    pipeline.invalidate()
+                    logger.debug("Mid-loop cache switch: offset=%d", contents_offset)
 
-            # Emit context update
+            # Emit context update (use token count from response metadata
+            # instead of making a separate count_tokens API call)
             if self.emit_lifecycle_events:
-                context_tokens = self._count_context_tokens()
                 emit_event(
                     EventType.CONTEXT_UPDATE,
                     agent=self.instance_id,
                     agent_type=self.name,
                     parent_agent=self._parent_agent,
                     wave_id=self._wave_id,
-                    details={"context_tokens": context_tokens},
+                    details={"context_tokens": last_prompt_token_count},
                 )
 
         token_usage = {
@@ -878,11 +899,71 @@ class Agent:
         }
         return f"[Max iterations ({self.MAX_ITERATIONS}) reached]", token_usage
 
+    @staticmethod
+    def _cached_config(
+        cache_name: str, temperature: float, max_output_tokens: int
+    ) -> types.GenerateContentConfig:
+        """Build a config that uses a cached context."""
+        return types.GenerateContentConfig(
+            cached_content=cache_name,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        )
+
+    def _build_base_config(
+        self, temperature: float, max_output_tokens: int
+    ) -> types.GenerateContentConfig:
+        """Build a config without caching."""
+        return types.GenerateContentConfig(
+            system_instruction=self.system_prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            tools=self._tool_functions if self._tool_functions else None,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        )
+
+    def _build_generate_config(
+        self,
+        temperature: float,
+        max_output_tokens: int,
+        wait_for_cache: bool = False,
+    ) -> tuple[types.GenerateContentConfig, int]:
+        """Query cache registry and return (config, contents_offset).
+
+        If a cache is available, returns a cached config with the
+        appropriate offset. Otherwise returns the base config with offset 0.
+
+        Args:
+            temperature: Sampling temperature.
+            max_output_tokens: Maximum tokens in response.
+            wait_for_cache: If True, block until any pending cache creation
+                completes before returning. Guarantees a cache hit when a
+                cache was recently submitted.
+        """
+        if self._cache_enabled:
+            advice = self._cache_registry.get_advice(
+                self.instance_id, self.system_prompt, self._tool_functions,
+                wait=wait_for_cache,
+            )
+            if advice.cache_name:
+                return (
+                    self._cached_config(advice.cache_name, temperature, max_output_tokens),
+                    advice.contents_offset,
+                )
+
+        return self._build_base_config(temperature, max_output_tokens), 0
+
     def run(
         self,
         prompt: str,
         temperature: float = 0.7,
         max_output_tokens: int = 32768,
+        wait_for_cache: bool = False,
     ) -> str:
         """Run the agent with a prompt (maintains conversation history).
 
@@ -890,6 +971,9 @@ class Agent:
             prompt: User prompt or task description.
             temperature: Sampling temperature.
             max_output_tokens: Maximum tokens in response.
+            wait_for_cache: If True, block until any pending cache creation
+                completes before the first generate call. Trades latency for
+                guaranteed cache savings on large contexts.
 
         Returns:
             The agent's final text response.
@@ -909,14 +993,6 @@ class Agent:
             )
 
         try:
-            base_config = types.GenerateContentConfig(
-                system_instruction=self.system_prompt,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-                tools=self._tool_functions if self._tool_functions else None,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            )
-
             user_content = types.Content(
                 role="user",
                 parts=[types.Part.from_text(text=prompt)],
@@ -924,55 +1000,36 @@ class Agent:
             self._history.append(user_content)
             self._save_history()
 
-            # Validate cache config hasn't drifted (system_prompt or tools changed)
-            pipeline = self._cache_pipeline
-            if pipeline and pipeline.has_ready_cache:
-                if not pipeline.is_config_valid(self.system_prompt, self._tool_functions):
-                    logger.warning("Cache invalidated: system_prompt or tools changed")
-                    pipeline.invalidate()
+            # Query cache registry for best available cache
+            config, contents_offset = self._build_generate_config(
+                temperature, max_output_tokens, wait_for_cache=wait_for_cache
+            )
 
-            if pipeline and pipeline.has_ready_cache:
-                cached_config = types.GenerateContentConfig(
-                    cached_content=pipeline.ready_cache_name,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
-                    ),
+            try:
+                result, token_usage = self._run_with_function_loop(
+                    self._history, config, contents_offset=contents_offset,
                 )
-                try:
-                    result, token_usage = self._run_with_function_loop(
-                        self._history,
-                        cached_config,
-                        contents_offset=pipeline.cached_through_index,
-                    )
-                except Exception as cache_err:
-                    # Cache expired or invalid — fall back to uncached
-                    logger.warning(
-                        f"Cached generate_content failed, falling back: {cache_err}"
-                    )
-                    pipeline.invalidate()
+            except Exception as e:
+                # If we were using a cache and it failed, fall back to uncached
+                if contents_offset > 0 and self._cache_enabled:
+                    logger.warning("Cached call failed, falling back: %s", e)
+                    self._cache_registry.invalidate(self.instance_id)
+                    base_config = self._build_base_config(temperature, max_output_tokens)
                     result, token_usage = self._run_with_function_loop(
                         self._history, base_config
                     )
-            else:
-                result, token_usage = self._run_with_function_loop(
-                    self._history, base_config
-                )
+                else:
+                    raise
 
-            # Post-round cache pipeline: promote pending, fire new
-            if pipeline and self._cache_executor:
-                pipeline.promote_pending()
-                if pipeline.should_cache(
+            # Notify cache registry: history has grown
+            if self._cache_enabled:
+                self._cache_registry.notify(
+                    self.instance_id,
                     self._history,
-                    last_prompt_token_count=token_usage.get("last_prompt_token_count"),
-                ):
-                    pipeline.create_cache_async(
-                        contents=list(self._history),
-                        system_instruction=self.system_prompt,
-                        tools=self._tool_functions if self._tool_functions else None,
-                        executor=self._cache_executor,
-                    )
+                    self.system_prompt,
+                    self._tool_functions or None,
+                    token_count=token_usage.get("last_prompt_token_count"),
+                )
 
             # Call hook
             self.on_agent_end(result, success=True)
@@ -1048,13 +1105,7 @@ class Agent:
             )
 
         try:
-            config = types.GenerateContentConfig(
-                system_instruction=self.system_prompt,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-                tools=self._tool_functions if self._tool_functions else None,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            )
+            config = self._build_base_config(temperature, max_output_tokens)
 
             contents = [
                 types.Content(

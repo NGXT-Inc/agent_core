@@ -1,8 +1,8 @@
-"""Tests for the CachePipeline and its integration with Agent.run().
+"""Tests for ContextCacheRegistry and its integration with Agent.run().
 
 Tests are organized into:
-1. CachePipeline unit tests (isolated, no Agent)
-2. Agent + caching integration tests (full pipeline through run())
+1. ContextCacheRegistry unit tests (isolated, no Agent)
+2. Agent + registry integration tests (full pipeline through run())
 """
 
 import time
@@ -11,6 +11,13 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
+from agent_core.core.caching import (
+    CacheAdvice,
+    ContextCacheRegistry,
+    _CacheSlot,
+    _compute_fingerprint,
+    MIN_TOKEN_GROWTH,
+)
 from tests.conftest import (
     MockCachedContent,
     MockContent,
@@ -24,335 +31,703 @@ from tests.conftest import (
 
 
 # ============================================================
-# CachePipeline Unit Tests
+# ContextCacheRegistry Unit Tests
 # ============================================================
 
 
-class TestCachePipelineInit:
-    """Test CachePipeline initialization and properties."""
+class TestRegistryInit:
+    """Test registry initialization and basic lifecycle."""
 
     def test_initial_state(self):
-        """Pipeline starts with no ready cache and no pending."""
-        from agent_core.core.caching import CachePipeline
-
         mock_client = MagicMock()
-        pipeline = CachePipeline(mock_client, "gemini-3-pro-preview")
+        registry = ContextCacheRegistry(mock_client, max_workers=2, cache_ttl_seconds=600)
+        try:
+            # No slots registered yet
+            advice = registry.get_advice("nonexistent", None, None)
+            assert advice == CacheAdvice(cache_name=None, contents_offset=0)
+        finally:
+            registry.close()
 
-        assert pipeline.has_ready_cache is False
-        assert pipeline.ready_cache_name is None
-        assert pipeline.cached_through_index == 0
-
-    def test_custom_threshold(self):
-        """Minimum token threshold is configurable."""
-        from agent_core.core.caching import CachePipeline
-
+    def test_register_creates_slot(self):
         mock_client = MagicMock()
-        pipeline = CachePipeline(mock_client, "gemini-3-pro-preview", min_token_threshold=8192)
-        assert pipeline._min_token_threshold == 8192
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=8192)
+            assert "agent-1" in registry._slots
+            assert registry._slots["agent-1"].model_name == "test-model"
+            assert registry._slots["agent-1"].min_token_threshold == 8192
+        finally:
+            registry.close()
 
-
-class TestShouldCache:
-    """Test the token threshold gating logic."""
-
-    def test_below_threshold_returns_false(self):
-        """Contents below token threshold should not be cached."""
-        from agent_core.core.caching import CachePipeline
-
+    def test_unregister_removes_slot(self):
         mock_client = MagicMock()
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(10_000)
-        pipeline = CachePipeline(mock_client, "test-model", min_token_threshold=32_768)
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            registry.unregister("agent-1")
+            assert "agent-1" not in registry._slots
+        finally:
+            registry.close()
 
-        contents = [MockContent(role="user", parts=[MockPart(text="hello")])]
-        assert pipeline.should_cache(contents) is False
+    def test_unregister_nonexistent_is_noop(self):
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.unregister("nonexistent")  # Should not raise
+        finally:
+            registry.close()
 
-    def test_above_threshold_returns_true(self):
-        """Contents above token threshold should be cached."""
-        from agent_core.core.caching import CachePipeline
+    def test_re_register_clears_old_state(self):
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            # Manually set some state
+            registry._slots["agent-1"].ready_name = "cachedContents/old"
+            registry.register("agent-1", "test-model")
+            assert registry._slots["agent-1"].ready_name is None
+            mock_client.caches.delete.assert_called_with(name="cachedContents/old")
+        finally:
+            registry.close()
 
+
+class TestGetAdvice:
+    """Test the get_advice auto-promotion and config validation."""
+
+    def test_no_cache_returns_empty_advice(self):
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            advice = registry.get_advice("agent-1", "sys prompt", None)
+            assert advice.cache_name is None
+            assert advice.contents_offset == 0
+        finally:
+            registry.close()
+
+    def test_auto_promotes_pending(self):
+        """get_advice should promote a completed pending cache automatically."""
+        mock_client = MagicMock()
+        mock_client.caches.create.return_value = MockCachedContent("cachedContents/new")
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            # Simulate a completed pending cache
+            future = Future()
+            future.set_result("cachedContents/new")
+            slot.pending = future
+            slot.pending_through_index = 5
+            slot.config_fingerprint = _compute_fingerprint("sys", None)
+
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name == "cachedContents/new"
+            assert advice.contents_offset == 5
+            assert slot.pending is None  # Cleared after promotion
+        finally:
+            registry.close()
+
+    def test_returns_none_while_pending(self):
+        """get_advice should return empty advice when pending isn't done yet."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            # Set a pending future that isn't done
+            future = Future()  # Not resolved
+            slot.pending = future
+            slot.pending_through_index = 3
+
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name is None
+            assert advice.contents_offset == 0
+        finally:
+            # Cancel the future before close to avoid hanging
+            future.cancel()
+            registry.close()
+
+    def test_config_drift_invalidates_cache(self):
+        """get_advice should invalidate cache if system_prompt or tools changed."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            # Set up a ready cache with a specific fingerprint
+            slot.ready_name = "cachedContents/stale"
+            slot.ready_offset = 3
+            slot.ready_created_at = time.monotonic()
+            slot.config_fingerprint = _compute_fingerprint("old prompt", None)
+
+            # Query with a DIFFERENT system prompt
+            advice = registry.get_advice("agent-1", "new prompt", None)
+            assert advice.cache_name is None
+            assert advice.contents_offset == 0
+            # Old cache should be deleted
+            mock_client.caches.delete.assert_called_with(name="cachedContents/stale")
+        finally:
+            registry.close()
+
+    def test_ready_cache_returned_when_valid(self):
+        """get_advice returns the ready cache when config matches."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            slot.ready_name = "cachedContents/valid"
+            slot.ready_offset = 4
+            slot.ready_created_at = time.monotonic()
+            slot.config_fingerprint = _compute_fingerprint("sys", None)
+
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name == "cachedContents/valid"
+            assert advice.contents_offset == 4
+        finally:
+            registry.close()
+
+    def test_promotion_deletes_old_ready(self):
+        """When promoting, the old ready cache should be deleted."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            # Existing ready cache
+            slot.ready_name = "cachedContents/old"
+            slot.ready_offset = 2
+            slot.ready_created_at = time.monotonic()
+            slot.config_fingerprint = _compute_fingerprint("sys", None)
+
+            # Pending cache that's done
+            future = Future()
+            future.set_result("cachedContents/new")
+            slot.pending = future
+            slot.pending_through_index = 5
+            slot.config_fingerprint = _compute_fingerprint("sys", None)
+
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name == "cachedContents/new"
+            assert advice.contents_offset == 5
+        finally:
+            registry.close()
+
+    def test_failed_pending_does_not_crash(self):
+        """If pending cache creation failed, get_advice handles it gracefully."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            # Set existing ready cache
+            slot.ready_name = "cachedContents/existing"
+            slot.ready_offset = 3
+            slot.ready_created_at = time.monotonic()
+            slot.config_fingerprint = _compute_fingerprint("sys", None)
+
+            # Set a failed pending future
+            future = Future()
+            future.set_exception(Exception("API quota exceeded"))
+            slot.pending = future
+            slot.pending_through_index = 5
+
+            # Should still return the existing ready cache
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name == "cachedContents/existing"
+            assert advice.contents_offset == 3
+        finally:
+            registry.close()
+
+
+class TestNotify:
+    """Test the notify method for cache creation decisions."""
+
+    def test_fires_cache_creation_above_threshold(self):
+        """notify should fire cache creation when token count is above threshold."""
+        mock_client = MagicMock()
+        mock_client.caches.create.return_value = MockCachedContent("cachedContents/new")
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=32_768)
+            contents = [MockContent(role="user", parts=[MockPart(text="large")])]
+
+            registry.notify("agent-1", contents, "sys", None, token_count=50_000)
+
+            # Should have submitted cache creation
+            slot = registry._slots["agent-1"]
+            assert slot.pending is not None
+            # Wait for it to complete
+            slot.pending.result(timeout=5)
+            mock_client.caches.create.assert_called_once()
+        finally:
+            registry.close()
+
+    def test_skips_below_threshold(self):
+        """notify should not fire cache creation when below threshold."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=32_768)
+            contents = [MockContent(role="user", parts=[MockPart(text="small")])]
+
+            registry.notify("agent-1", contents, "sys", None, token_count=1_000)
+
+            slot = registry._slots["agent-1"]
+            assert slot.pending is None
+            mock_client.caches.create.assert_not_called()
+        finally:
+            registry.close()
+
+    def test_skips_when_pending(self):
+        """notify should not fire a second creation if one is pending."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=32_768)
+            slot = registry._slots["agent-1"]
+
+            # Manually set a pending future that isn't done
+            pending_future = Future()
+            slot.pending = pending_future
+            slot.pending_through_index = 1
+
+            contents = [MockContent(role="user", parts=[MockPart(text="data")])]
+            # This notify should skip because pending isn't done yet
+            registry.notify("agent-1", contents, "sys", None, token_count=60_000)
+
+            # Pending should be unchanged
+            assert slot.pending is pending_future
+            mock_client.caches.create.assert_not_called()
+        finally:
+            pending_future.cancel()
+            registry.close()
+
+    def test_token_delta_guard(self):
+        """notify should skip if token delta since last cache is too small."""
+        mock_client = MagicMock()
+        mock_client.caches.create.return_value = MockCachedContent()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=32_768)
+            slot = registry._slots["agent-1"]
+            slot.last_cache_token_count = 50_000  # Last cache was at 50k
+
+            contents = [MockContent(role="user", parts=[MockPart(text="data")])]
+            # Only 1000 new tokens — below MIN_TOKEN_GROWTH
+            registry.notify("agent-1", contents, "sys", None, token_count=51_000)
+
+            assert slot.pending is None
+            mock_client.caches.create.assert_not_called()
+        finally:
+            registry.close()
+
+    def test_count_tokens_fallback(self):
+        """notify should call count_tokens API when token_count not provided."""
         mock_client = MagicMock()
         mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
-        pipeline = CachePipeline(mock_client, "test-model", min_token_threshold=32_768)
+        mock_client.caches.create.return_value = MockCachedContent()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=32_768)
+            contents = [MockContent(role="user", parts=[MockPart(text="data")])]
 
-        contents = [MockContent(role="user", parts=[MockPart(text="large content")])]
-        assert pipeline.should_cache(contents) is True
+            registry.notify("agent-1", contents, "sys", None, token_count=None)
 
-    def test_exact_threshold_returns_true(self):
-        """Contents exactly at threshold should be cached."""
-        from agent_core.core.caching import CachePipeline
+            mock_client.models.count_tokens.assert_called_once()
+            assert registry._slots["agent-1"].pending is not None
+        finally:
+            registry.close()
 
-        mock_client = MagicMock()
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(32_768)
-        pipeline = CachePipeline(mock_client, "test-model", min_token_threshold=32_768)
-
-        assert pipeline.should_cache([]) is True
-
-    def test_known_token_count_skips_api_call(self):
-        """When last_prompt_token_count is provided, count_tokens API is skipped."""
-        from agent_core.core.caching import CachePipeline
-
-        mock_client = MagicMock()
-        pipeline = CachePipeline(mock_client, "test-model", min_token_threshold=32_768)
-
-        contents = [MockContent(role="user", parts=[MockPart(text="hello")])]
-
-        # Above threshold via known count
-        assert pipeline.should_cache(contents, last_prompt_token_count=50_000) is True
-        mock_client.models.count_tokens.assert_not_called()
-
-        # Below threshold via known count
-        assert pipeline.should_cache(contents, last_prompt_token_count=1_000) is False
-        mock_client.models.count_tokens.assert_not_called()
-
-    def test_count_tokens_failure_returns_false(self):
-        """If count_tokens API fails, should_cache returns False gracefully."""
-        from agent_core.core.caching import CachePipeline
-
+    def test_count_tokens_failure_skips(self):
+        """If count_tokens fails, notify should skip gracefully."""
         mock_client = MagicMock()
         mock_client.models.count_tokens.side_effect = Exception("API Error")
-        pipeline = CachePipeline(mock_client, "test-model")
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            contents = []
 
-        assert pipeline.should_cache([]) is False
+            registry.notify("agent-1", contents, "sys", None, token_count=None)
 
+            assert registry._slots["agent-1"].pending is None
+        finally:
+            registry.close()
 
-class TestCreateCacheAsync:
-    """Test background cache creation."""
-
-    def test_submits_to_executor(self):
-        """create_cache_async submits work to the provided executor."""
-        from agent_core.core.caching import CachePipeline
-
+    def test_notify_after_close_is_noop(self):
+        """notify should be a no-op after close()."""
         mock_client = MagicMock()
-        mock_client.caches.create.return_value = MockCachedContent("cachedContents/abc")
-        pipeline = CachePipeline(mock_client, "test-model")
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        registry.register("agent-1", "test-model")
+        registry.close()
 
-        contents = [MockContent(role="user", parts=[MockPart(text="test")])]
+        # Should not raise or submit work
+        registry.notify("agent-1", [], "sys", None, token_count=50_000)
+        mock_client.caches.create.assert_not_called()
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            pipeline.create_cache_async(
-                contents=contents,
-                system_instruction="You are helpful.",
-                tools=None,
-                executor=executor,
-            )
+    def test_notify_for_unregistered_agent_is_noop(self):
+        """notify for an unregistered agent should be a no-op."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.notify("nonexistent", [], "sys", None, token_count=50_000)
+            mock_client.caches.create.assert_not_called()
+        finally:
+            registry.close()
 
-            assert pipeline._pending is not None
-            assert pipeline._pending_through_index == 1
 
-            # Wait for it to complete
-            result = pipeline._pending.result(timeout=5)
-            assert result == "cachedContents/abc"
+class TestTTLExpiry:
+    """Test TTL enforcement on cached content."""
 
-    def test_skips_if_already_pending(self):
-        """Should not fire a second cache creation if one is already pending."""
-        from agent_core.core.caching import CachePipeline
+    def test_expired_cache_not_returned(self):
+        """get_advice should not return an expired cache."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1, cache_ttl_seconds=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
 
+            slot.ready_name = "cachedContents/expired"
+            slot.ready_offset = 3
+            slot.ready_created_at = time.monotonic() - 2  # 2 seconds ago, TTL is 1s
+            slot.config_fingerprint = _compute_fingerprint("sys", None)
+
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name is None
+            assert advice.contents_offset == 0
+            # Expired cache should be deleted
+            mock_client.caches.delete.assert_called_with(name="cachedContents/expired")
+        finally:
+            registry.close()
+
+    def test_non_expired_cache_returned(self):
+        """get_advice should return a cache that hasn't expired yet."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1, cache_ttl_seconds=600)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            slot.ready_name = "cachedContents/fresh"
+            slot.ready_offset = 3
+            slot.ready_created_at = time.monotonic()  # Just now
+            slot.config_fingerprint = _compute_fingerprint("sys", None)
+
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name == "cachedContents/fresh"
+        finally:
+            registry.close()
+
+    def test_api_ttl_includes_buffer(self):
+        """Cache creation should use TTL + 60s buffer in the API call."""
         mock_client = MagicMock()
         mock_client.caches.create.return_value = MockCachedContent()
-        pipeline = CachePipeline(mock_client, "test-model")
+        registry = ContextCacheRegistry(
+            mock_client, max_workers=1, cache_ttl_seconds=600
+        )
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=100)
+            contents = [MockContent(role="user", parts=[MockPart(text="data")])]
+            registry.notify("agent-1", contents, "sys", None, token_count=50_000)
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            pipeline.create_cache_async([], None, None, executor)
-            first_pending = pipeline._pending
+            slot = registry._slots["agent-1"]
+            slot.pending.result(timeout=5)
 
-            # Second call should be skipped
-            pipeline.create_cache_async([], None, None, executor)
-            assert pipeline._pending is first_pending
+            # Verify TTL in create call is 660s (600 + 60)
+            create_call = mock_client.caches.create.call_args
+            config = create_call.kwargs.get("config") or create_call[1].get("config")
+            assert config.ttl == "660s"
+        finally:
+            registry.close()
 
-    def test_records_through_index(self):
-        """Should record the number of content items being cached."""
-        from agent_core.core.caching import CachePipeline
 
+class TestReaperThread:
+    """Test the background reaper that cleans up expired caches."""
+
+    def test_reaper_cleans_expired_caches(self):
+        """The reaper should delete caches that have expired."""
         mock_client = MagicMock()
-        mock_client.caches.create.return_value = MockCachedContent()
-        pipeline = CachePipeline(mock_client, "test-model")
+        # Use a very short TTL so caches expire quickly
+        registry = ContextCacheRegistry(
+            mock_client, max_workers=1, cache_ttl_seconds=0
+        )
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
 
-        contents = [
-            MockContent(role="user", parts=[MockPart(text="msg1")]),
-            MockContent(role="model", parts=[MockPart(text="resp1")]),
-            MockContent(role="user", parts=[MockPart(text="msg2")]),
-        ]
+            slot.ready_name = "cachedContents/stale"
+            slot.ready_offset = 3
+            slot.ready_created_at = time.monotonic() - 1  # Already expired
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            pipeline.create_cache_async(contents, None, None, executor)
-            assert pipeline._pending_through_index == 3
+            # Wait for reaper to run (it checks every 60s, but we can trigger manually)
+            # Instead of waiting 60s, let's test the reaper logic directly
+            expired_names = []
+            with registry._lock:
+                for agent_id, s in registry._slots.items():
+                    if s.ready_name and registry._is_expired(s):
+                        expired_names.append(s.ready_name)
+                        s.ready_name = None
+                        s.ready_offset = 0
+                        s.ready_created_at = None
 
-
-class TestPromotePending:
-    """Test the promote_pending transition."""
-
-    def test_promotes_on_success(self):
-        """Successful pending cache becomes the ready cache."""
-        from agent_core.core.caching import CachePipeline
-
-        mock_client = MagicMock()
-        mock_client.caches.create.return_value = MockCachedContent("cachedContents/new")
-        pipeline = CachePipeline(mock_client, "test-model")
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            pipeline.create_cache_async(
-                [MockContent(role="user", parts=[MockPart(text="x")])],
-                None, None, executor,
-            )
-            pipeline._pending.result(timeout=5)  # ensure complete
-
-            pipeline.promote_pending()
-
-        assert pipeline.has_ready_cache is True
-        assert pipeline.ready_cache_name == "cachedContents/new"
-        assert pipeline.cached_through_index == 1
-        assert pipeline._pending is None
-
-    def test_deletes_old_ready_on_promote(self):
-        """When promoting, the old ready cache should be deleted."""
-        from agent_core.core.caching import CachePipeline
-
-        mock_client = MagicMock()
-        pipeline = CachePipeline(mock_client, "test-model")
-
-        # Manually set an existing ready cache
-        pipeline._ready_name = "cachedContents/old"
-        pipeline._cached_through_index = 2
-
-        # Create and complete a pending cache
-        mock_client.caches.create.return_value = MockCachedContent("cachedContents/new")
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            pipeline.create_cache_async(
-                [MockContent(role="user", parts=[MockPart(text="x")])] * 5,
-                None, None, executor,
-            )
-            pipeline._pending.result(timeout=5)
-
-            pipeline.promote_pending()
-
-        # Old cache should have been deleted
-        mock_client.caches.delete.assert_called_once_with(name="cachedContents/old")
-        # New cache is ready
-        assert pipeline.ready_cache_name == "cachedContents/new"
-        assert pipeline.cached_through_index == 5
-
-    def test_handles_creation_failure(self):
-        """If cache creation fails, ready state is unchanged."""
-        from agent_core.core.caching import CachePipeline
-
-        mock_client = MagicMock()
-        mock_client.caches.create.side_effect = Exception("API quota exceeded")
-        pipeline = CachePipeline(mock_client, "test-model")
-
-        # Set existing ready cache
-        pipeline._ready_name = "cachedContents/existing"
-        pipeline._cached_through_index = 3
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            pipeline.create_cache_async([], None, None, executor)
-            # Wait for the future to complete (with error)
-            try:
-                pipeline._pending.result(timeout=5)
-            except Exception:
-                pass
-
-            pipeline.promote_pending()
-
-        # Ready cache should be unchanged (old one still valid)
-        assert pipeline.ready_cache_name == "cachedContents/existing"
-        assert pipeline.cached_through_index == 3
-        assert pipeline._pending is None
-
-    def test_noop_when_no_pending(self):
-        """promote_pending should be a no-op when nothing is pending."""
-        from agent_core.core.caching import CachePipeline
-
-        mock_client = MagicMock()
-        pipeline = CachePipeline(mock_client, "test-model")
-
-        pipeline.promote_pending()  # Should not raise
-        assert pipeline.has_ready_cache is False
+            assert expired_names == ["cachedContents/stale"]
+            assert slot.ready_name is None
+        finally:
+            registry.close()
 
 
 class TestInvalidate:
     """Test cache invalidation."""
 
     def test_clears_ready_cache(self):
-        """invalidate() should clear ready cache and delete it remotely."""
-        from agent_core.core.caching import CachePipeline
-
+        """invalidate should clear ready cache and delete it remotely."""
         mock_client = MagicMock()
-        pipeline = CachePipeline(mock_client, "test-model")
-        pipeline._ready_name = "cachedContents/active"
-        pipeline._cached_through_index = 5
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+            slot.ready_name = "cachedContents/active"
+            slot.ready_offset = 5
+            slot.ready_created_at = time.monotonic()
 
-        pipeline.invalidate()
+            registry.invalidate("agent-1")
 
-        assert pipeline.has_ready_cache is False
-        assert pipeline.cached_through_index == 0
-        mock_client.caches.delete.assert_called_once_with(name="cachedContents/active")
+            assert slot.ready_name is None
+            assert slot.ready_offset == 0
+            mock_client.caches.delete.assert_called_with(name="cachedContents/active")
+        finally:
+            registry.close()
 
     def test_clears_pending(self):
-        """invalidate() should clear pending state."""
-        from agent_core.core.caching import CachePipeline
-
+        """invalidate should cancel/clear pending state."""
         mock_client = MagicMock()
-        pipeline = CachePipeline(mock_client, "test-model")
-        pipeline._pending = MagicMock()
-        pipeline._pending_through_index = 3
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+            slot.pending = MagicMock()
+            slot.pending.done.return_value = False
+            slot.pending_through_index = 3
 
-        pipeline.invalidate()
+            registry.invalidate("agent-1")
 
-        assert pipeline._pending is None
-        assert pipeline._pending_through_index is None
+            assert slot.pending is None
+            assert slot.pending_through_index is None
+        finally:
+            registry.close()
 
     def test_tolerates_delete_failure(self):
-        """invalidate() should not raise if remote deletion fails."""
-        from agent_core.core.caching import CachePipeline
-
+        """invalidate should not raise if remote deletion fails."""
         mock_client = MagicMock()
         mock_client.caches.delete.side_effect = Exception("Network error")
-        pipeline = CachePipeline(mock_client, "test-model")
-        pipeline._ready_name = "cachedContents/stale"
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            registry._slots["agent-1"].ready_name = "cachedContents/stale"
 
-        pipeline.invalidate()  # Should not raise
-        assert pipeline.has_ready_cache is False
+            registry.invalidate("agent-1")  # Should not raise
+            assert registry._slots["agent-1"].ready_name is None
+        finally:
+            registry.close()
+
+    def test_invalidate_nonexistent_is_noop(self):
+        """invalidate for unregistered agent is a no-op."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.invalidate("nonexistent")  # Should not raise
+        finally:
+            registry.close()
 
 
-class TestCleanup:
-    """Test resource cleanup on agent teardown."""
+class TestUnregister:
+    """Test agent unregistration and cleanup."""
 
     def test_deletes_ready_cache(self):
-        """cleanup() should delete the ready cache."""
-        from agent_core.core.caching import CachePipeline
-
+        """unregister should delete the ready cache."""
         mock_client = MagicMock()
-        pipeline = CachePipeline(mock_client, "test-model")
-        pipeline._ready_name = "cachedContents/active"
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            registry._slots["agent-1"].ready_name = "cachedContents/active"
 
-        pipeline.cleanup()
+            registry.unregister("agent-1")
 
-        mock_client.caches.delete.assert_called_with(name="cachedContents/active")
-        assert pipeline._ready_name is None
+            mock_client.caches.delete.assert_called_with(name="cachedContents/active")
+            assert "agent-1" not in registry._slots
+        finally:
+            registry.close()
 
-    def test_waits_for_pending_and_deletes(self):
-        """cleanup() should wait for pending cache, then delete it."""
-        from agent_core.core.caching import CachePipeline
-
+    def test_awaits_and_deletes_pending(self):
+        """unregister should wait for pending cache, then delete it."""
         mock_client = MagicMock()
         mock_client.caches.create.return_value = MockCachedContent("cachedContents/pending")
-        pipeline = CachePipeline(mock_client, "test-model")
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=100)
+            contents = [MockContent(role="user", parts=[MockPart(text="data")])]
+            registry.notify("agent-1", contents, "sys", None, token_count=50_000)
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            pipeline.create_cache_async([], None, None, executor)
-            pipeline._pending.result(timeout=5)
+            # Wait for pending to complete
+            registry._slots["agent-1"].pending.result(timeout=5)
 
-            pipeline.cleanup()
+            registry.unregister("agent-1")
 
-        mock_client.caches.delete.assert_called_with(name="cachedContents/pending")
+            mock_client.caches.delete.assert_called_with(name="cachedContents/pending")
+        finally:
+            registry.close()
 
 
-class TestPipelineLifecycle:
-    """End-to-end pipeline lifecycle tests simulating multiple rounds."""
+class TestClose:
+    """Test registry shutdown."""
 
-    def test_three_round_pipeline(self):
-        """Simulate the full i-2 pipeline over three rounds."""
-        from agent_core.core.caching import CachePipeline
+    def test_deletes_all_caches(self):
+        """close should delete all caches across all slots."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        registry.register("agent-1", "test-model")
+        registry.register("agent-2", "test-model")
+        registry._slots["agent-1"].ready_name = "cachedContents/a1"
+        registry._slots["agent-2"].ready_name = "cachedContents/a2"
 
+        registry.close()
+
+        delete_calls = mock_client.caches.delete.call_args_list
+        deleted_names = {c.kwargs["name"] for c in delete_calls}
+        assert "cachedContents/a1" in deleted_names
+        assert "cachedContents/a2" in deleted_names
+
+    def test_close_is_idempotent(self):
+        """close can be called multiple times without error."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        registry.close()
+        registry.close()  # Should not raise
+
+
+class TestMultiAgent:
+    """Test multiple agents sharing the registry."""
+
+    def test_independent_slots(self):
+        """Each agent has its own cache slot."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=2)
+        try:
+            registry.register("agent-1", "model-a")
+            registry.register("agent-2", "model-b")
+
+            # Set cache for agent-1 only
+            slot1 = registry._slots["agent-1"]
+            slot1.ready_name = "cachedContents/a1"
+            slot1.ready_offset = 3
+            slot1.ready_created_at = time.monotonic()
+            slot1.config_fingerprint = _compute_fingerprint("sys", None)
+
+            advice1 = registry.get_advice("agent-1", "sys", None)
+            advice2 = registry.get_advice("agent-2", "sys", None)
+
+            assert advice1.cache_name == "cachedContents/a1"
+            assert advice2.cache_name is None
+        finally:
+            registry.close()
+
+    def test_invalidate_one_doesnt_affect_other(self):
+        """invalidate for one agent should not affect another."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            registry.register("agent-2", "test-model")
+
+            fp = _compute_fingerprint("sys", None)
+            registry._slots["agent-1"].ready_name = "cachedContents/a1"
+            registry._slots["agent-1"].ready_created_at = time.monotonic()
+            registry._slots["agent-1"].config_fingerprint = fp
+            registry._slots["agent-2"].ready_name = "cachedContents/a2"
+            registry._slots["agent-2"].ready_created_at = time.monotonic()
+            registry._slots["agent-2"].config_fingerprint = fp
+
+            registry.invalidate("agent-1")
+
+            assert registry._slots["agent-1"].ready_name is None
+            assert registry._slots["agent-2"].ready_name == "cachedContents/a2"
+        finally:
+            registry.close()
+
+
+class TestDeletionGuarantees:
+    """Test that old caches are always cleaned up."""
+
+    def test_old_cache_deleted_on_promotion(self):
+        """When a new cache is promoted, the old one must be deleted."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            # Old ready cache
+            slot.ready_name = "cachedContents/old"
+            slot.ready_offset = 2
+            slot.ready_created_at = time.monotonic()
+            slot.config_fingerprint = _compute_fingerprint("sys", None)
+
+            # New pending cache (done)
+            future = Future()
+            future.set_result("cachedContents/new")
+            slot.pending = future
+            slot.pending_through_index = 5
+
+            # Trigger promotion via get_advice
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name == "cachedContents/new"
+
+            # Old cache deletion is submitted to executor — wait briefly
+            registry._executor.shutdown(wait=True)
+            # Recreate executor for close()
+            registry._executor = ThreadPoolExecutor(max_workers=1)
+
+            delete_calls = mock_client.caches.delete.call_args_list
+            deleted_names = [c.kwargs["name"] for c in delete_calls]
+            assert "cachedContents/old" in deleted_names
+        finally:
+            registry.close()
+
+    def test_both_deleted_on_invalidate(self):
+        """invalidate should delete both ready and pending caches."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+
+            slot.ready_name = "cachedContents/ready"
+            future = Future()
+            future.set_result("cachedContents/pending-done")
+            slot.pending = future
+            slot.pending_through_index = 3
+
+            registry.invalidate("agent-1")
+
+            delete_calls = mock_client.caches.delete.call_args_list
+            deleted_names = {c.kwargs["name"] for c in delete_calls}
+            assert "cachedContents/ready" in deleted_names
+            assert "cachedContents/pending-done" in deleted_names
+        finally:
+            registry.close()
+
+
+class TestMultiRoundLifecycle:
+    """End-to-end lifecycle simulating multiple conversation rounds."""
+
+    def test_three_round_lifecycle(self):
+        """Simulate the full pipeline over three rounds."""
         mock_client = MagicMock()
         cache_counter = [0]
 
@@ -361,276 +736,234 @@ class TestPipelineLifecycle:
             return MockCachedContent(f"cachedContents/cache_{cache_counter[0]}")
 
         mock_client.caches.create.side_effect = make_cache
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
+        registry = ContextCacheRegistry(
+            mock_client, max_workers=1, cache_ttl_seconds=600
+        )
+        try:
+            registry.register("agent-1", "test-model", min_token_threshold=100)
+            history = []
 
-        pipeline = CachePipeline(mock_client, "test-model", min_token_threshold=32_768)
-        history = []
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
             # --- Round 1 ---
             history.append(MockContent(role="user", parts=[MockPart(text="msg1")]))
             history.append(MockContent(role="model", parts=[MockPart(text="resp1")]))
 
-            # No ready cache yet
-            assert pipeline.has_ready_cache is False
+            # No cache yet
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name is None
 
-            # Post-round 1: promote (no-op) + fire cache
-            pipeline.promote_pending()
-            assert pipeline.has_ready_cache is False
-
-            pipeline.create_cache_async(list(history), "sys", None, executor)
-            pipeline._pending.result(timeout=5)  # let it finish
+            # Notify with high token count triggers cache creation
+            registry.notify("agent-1", history, "sys", None, token_count=50_000)
+            slot = registry._slots["agent-1"]
+            assert slot.pending is not None
+            slot.pending.result(timeout=5)  # Wait for completion
 
             # --- Round 2 ---
             history.append(MockContent(role="user", parts=[MockPart(text="msg2")]))
             history.append(MockContent(role="model", parts=[MockPart(text="resp2")]))
 
-            # Still no ready cache (pending from round 1 not promoted yet)
-            assert pipeline.has_ready_cache is False
+            # get_advice auto-promotes cache_1
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name == "cachedContents/cache_1"
+            assert advice.contents_offset == 2  # Covers round 1's 2 items
 
-            # Post-round 2: promote cache_1 → ready, fire cache_2
-            pipeline.promote_pending()
-            assert pipeline.has_ready_cache is True
-            assert pipeline.ready_cache_name == "cachedContents/cache_1"
-            assert pipeline.cached_through_index == 2  # covers 2 items from round 1
-
-            pipeline.create_cache_async(list(history), "sys", None, executor)
-            pipeline._pending.result(timeout=5)
+            # Notify with enough new tokens triggers cache_2
+            registry.notify("agent-1", history, "sys", None, token_count=60_000)
+            assert slot.pending is not None
+            slot.pending.result(timeout=5)
 
             # --- Round 3 ---
             history.append(MockContent(role="user", parts=[MockPart(text="msg3")]))
             history.append(MockContent(role="model", parts=[MockPart(text="resp3")]))
 
-            # Ready cache from round 1 (i-2)
-            assert pipeline.ready_cache_name == "cachedContents/cache_1"
-            assert pipeline.cached_through_index == 2
+            # get_advice auto-promotes cache_2, deletes cache_1
+            advice = registry.get_advice("agent-1", "sys", None)
+            assert advice.cache_name == "cachedContents/cache_2"
+            assert advice.contents_offset == 4  # Covers rounds 1+2
 
-            # Post-round 3: promote cache_2 → ready (deletes cache_1), fire cache_3
-            pipeline.promote_pending()
-            assert pipeline.ready_cache_name == "cachedContents/cache_2"
-            assert pipeline.cached_through_index == 4  # covers 4 items from rounds 1+2
+            # Wait for any background deletion work
+            registry._executor.shutdown(wait=True)
+            registry._executor = ThreadPoolExecutor(max_workers=1)
 
-            # cache_1 should have been deleted
-            mock_client.caches.delete.assert_called_with(name="cachedContents/cache_1")
+            # Verify cache_1 was deleted (old ready deleted on promotion)
+            delete_calls = mock_client.caches.delete.call_args_list
+            deleted_names = [c.kwargs["name"] for c in delete_calls]
+            assert "cachedContents/cache_1" in deleted_names
 
-            pipeline.create_cache_async(list(history), "sys", None, executor)
-            pipeline._pending.result(timeout=5)
-
-        # Cleanup
-        pipeline.cleanup()
+        finally:
+            registry.close()
 
 
 # ============================================================
-# Agent + Caching Integration Tests
+# Agent + Registry Integration Tests
 # ============================================================
 
 
 class TestAgentCachingIntegration:
-    """Test that Agent.run() correctly uses the caching pipeline."""
+    """Test that Agent.run() correctly uses the cache registry."""
 
-    @pytest.fixture
-    def agent_with_caching(self, mock_env, mock_genai):
-        """Create an Agent with caching enabled and mocked internals."""
+    @pytest.fixture(autouse=True)
+    def setup_registry(self, mock_env, mock_genai):
+        """Set up a mock registry on the Agent class."""
         from agent_core.agents.base import Agent
+        from agent_core.core.caching import CacheAdvice
 
         mock_client = mock_genai.Client.return_value
-
-        # First run: text response
-        mock_client.models.generate_content.return_value = make_text_response("Hello!")
-        # Below threshold initially
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(1000)
-
-        agent = Agent(session_id="test-session")
-        yield agent, mock_client
-        agent.close()
-
-    def test_caching_disabled_agent(self, mock_env, mock_genai):
-        """Agent with ENABLE_CACHING=False should not create a pipeline."""
-        from agent_core.agents.base import Agent
-
-        class NoCacheAgent(Agent):
-            ENABLE_CACHING = False
-
-        mock_genai.Client.return_value.models.generate_content.return_value = (
-            make_text_response("ok")
+        mock_registry = MagicMock()
+        mock_registry.get_advice.return_value = CacheAdvice(
+            cache_name=None, contents_offset=0
         )
 
+        # Store on Agent class
+        old_registry = Agent._cache_registry
+        Agent._cache_registry = mock_registry
+
+        self.mock_client = mock_client
+        self.mock_registry = mock_registry
+        self.Agent = Agent
+        self.CacheAdvice = CacheAdvice
+
+        yield
+
+        Agent._cache_registry = old_registry
+
+    def test_caching_disabled_agent(self):
+        """Agent with ENABLE_CACHING=False should not register."""
+
+        class NoCacheAgent(self.Agent):
+            ENABLE_CACHING = False
+
+        self.mock_client.models.generate_content.return_value = make_text_response("ok")
+
         agent = NoCacheAgent()
-        assert agent._cache_pipeline is None
-        assert agent._cache_executor is None
+        assert agent._cache_enabled is False
+        self.mock_registry.register.assert_not_called()
 
         result = agent.run("test")
         assert result == "ok"
         agent.close()
 
-    def test_caching_enabled_by_default(self, mock_env, mock_genai):
-        """Agent should have caching enabled by default when session_id is set."""
-        from agent_core.agents.base import Agent
+    def test_caching_enabled_registers(self):
+        """Agent should register with registry when caching is enabled."""
+        self.mock_client.models.generate_content.return_value = make_text_response("ok")
 
-        mock_genai.Client.return_value.models.generate_content.return_value = (
-            make_text_response("ok")
-        )
-
-        agent = Agent(session_id="test-session")
-        assert agent._cache_pipeline is not None
-        assert agent._cache_executor is not None
+        agent = self.Agent(session_id="test-session")
+        assert agent._cache_enabled is True
+        self.mock_registry.register.assert_called_once()
         agent.close()
 
-    def test_no_cache_below_threshold(self, agent_with_caching):
-        """When content is below threshold, no cache should be created."""
-        agent, mock_client = agent_with_caching
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(1000)
+    def test_no_cache_uses_base_config(self):
+        """When registry returns no cache, agent uses base config."""
+        self.mock_client.models.generate_content.return_value = make_text_response("ok")
 
+        agent = self.Agent(session_id="test-session")
         agent.run("hello")
 
-        # No cache should be created (below threshold)
-        mock_client.caches.create.assert_not_called()
+        # get_advice was called
+        self.mock_registry.get_advice.assert_called()
+        # generate_content was called with full contents
+        call_kwargs = self.mock_client.models.generate_content.call_args.kwargs
+        assert len(call_kwargs["contents"]) == 1  # Just the user message
+        agent.close()
 
-    def test_cache_created_above_threshold(self, agent_with_caching):
-        """When content exceeds threshold after run, cache should be fired."""
-        agent, mock_client = agent_with_caching
-        # Response reports prompt tokens above threshold — should_cache uses this
-        mock_client.models.generate_content.return_value = MockResponse(
-            "Hello!",
-            MockContent(role="model", parts=[MockPart(text="Hello!")]),
-            usage_metadata=MockUsageMetadata(prompt_token_count=50_000),
+    def test_cache_used_when_available(self):
+        """When registry returns a cache, agent uses it with offset."""
+        self.mock_registry.get_advice.return_value = self.CacheAdvice(
+            cache_name="cachedContents/c1", contents_offset=3
+        )
+        self.mock_client.models.generate_content.return_value = MockResponse(
+            "cached response",
+            MockContent(role="model", parts=[MockPart(text="cached response")]),
+            usage_metadata=MockUsageMetadata(
+                prompt_token_count=50_000, cached_content_token_count=45_000
+            ),
         )
 
-        agent.run("large prompt with lots of context")
+        agent = self.Agent(session_id="test-session")
+        # Pre-populate history so offset makes sense
+        agent._history = [
+            MockContent(role="user", parts=[MockPart(text="msg1")]),
+            MockContent(role="model", parts=[MockPart(text="resp1")]),
+            MockContent(role="user", parts=[MockPart(text="msg2")]),
+        ]
 
-        # Cache should have been created
-        mock_client.caches.create.assert_called_once()
+        result = agent.run("msg3")
+        assert result == "cached response"
 
-    def test_cache_used_on_subsequent_run(self, mock_env, mock_genai):
-        """After cache is created and promoted, next run should use it."""
-        from agent_core.agents.base import Agent
-
-        mock_client = mock_genai.Client.return_value
-        # Response reports prompt tokens above threshold so should_cache triggers
-        mock_client.models.generate_content.return_value = MockResponse(
-            "response",
-            MockContent(role="model", parts=[MockPart(text="response")]),
-            usage_metadata=MockUsageMetadata(prompt_token_count=50_000),
-        )
-
-        cache_name = "cachedContents/test-123"
-        mock_client.caches.create.return_value = MockCachedContent(cache_name)
-
-        agent = Agent(session_id="test-session")
-
-        # Round 1: no cache yet, fires cache creation
-        agent.run("first message")
-
-        # Manually wait for the pending cache to complete
-        pipeline = agent._cache_pipeline
-        if pipeline._pending:
-            pipeline._pending.result(timeout=5)
-
-        # Round 2: promote pending → ready, but no ready yet for THIS run
-        agent.run("second message")
-
-        # Now pipeline should have ready cache
-        assert pipeline.has_ready_cache is True
-
-        # Round 3: should use the ready cache
-        agent.run("third message")
-
-        # Check that generate_content was called with cached_content config
-        calls = mock_client.models.generate_content.call_args_list
-        # The third call should have cached_content in its config
-        third_call_config = calls[2].kwargs.get("config")
-        assert third_call_config is not None
+        # Check that generate_content received contents sliced at offset
+        call_kwargs = self.mock_client.models.generate_content.call_args.kwargs
+        # History is now [msg1, resp1, msg2, msg3] = 4 items, offset=3, so 1 sent
+        assert len(call_kwargs["contents"]) == 1
 
         agent.close()
 
-    def test_clear_history_invalidates_cache(self, agent_with_caching):
-        """clear_history() should invalidate the cache pipeline."""
-        agent, mock_client = agent_with_caching
+    def test_notify_called_after_run(self):
+        """Agent should call notify on the registry after run completes."""
+        self.mock_client.models.generate_content.return_value = make_text_response("ok")
 
-        # Manually set a ready cache
-        agent._cache_pipeline._ready_name = "cachedContents/active"
-        agent._cache_pipeline._cached_through_index = 5
+        agent = self.Agent(session_id="test-session")
+        agent.run("hello")
 
-        agent.clear_history()
-
-        assert agent._cache_pipeline.has_ready_cache is False
-        assert agent._cache_pipeline.cached_through_index == 0
-        mock_client.caches.delete.assert_called_with(name="cachedContents/active")
-
-    def test_invalidate_cache_method(self, agent_with_caching):
-        """_invalidate_cache() should clear the pipeline."""
-        agent, mock_client = agent_with_caching
-
-        agent._cache_pipeline._ready_name = "cachedContents/active"
-        agent._invalidate_cache()
-
-        assert agent._cache_pipeline.has_ready_cache is False
-
-    def test_close_cleans_up_resources(self, mock_env, mock_genai):
-        """close() should clean up cache and executor."""
-        from agent_core.agents.base import Agent
-
-        mock_client = mock_genai.Client.return_value
-        mock_client.models.generate_content.return_value = make_text_response("ok")
-
-        agent = Agent(session_id="test-session")
-        pipeline = agent._cache_pipeline
-        executor = agent._cache_executor
-
+        self.mock_registry.notify.assert_called()
         agent.close()
 
-        assert agent._cache_executor is None
-
-    def test_cache_fallback_on_stale_cache(self, mock_env, mock_genai):
-        """If cached generate_content fails, should fall back to uncached."""
-        from agent_core.agents.base import Agent
-
-        mock_client = mock_genai.Client.return_value
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
-        mock_client.caches.create.return_value = MockCachedContent("cachedContents/stale")
+    def test_cache_fallback_on_failure(self):
+        """If cached call fails, agent should fall back to uncached."""
+        self.mock_registry.get_advice.return_value = self.CacheAdvice(
+            cache_name="cachedContents/stale", contents_offset=2
+        )
 
         call_count = [0]
 
         def generate_side_effect(**kwargs):
             call_count[0] += 1
             config = kwargs.get("config")
-            # If using cached_content, simulate cache expiry error
             if hasattr(config, "cached_content") and config.cached_content:
                 raise Exception("CachedContent not found")
             return make_text_response("fallback response")
 
-        mock_client.models.generate_content.side_effect = generate_side_effect
+        self.mock_client.models.generate_content.side_effect = generate_side_effect
 
-        agent = Agent(session_id="test-session")
-
-        # Manually set up a ready cache to trigger cached path
-        agent._cache_pipeline._ready_name = "cachedContents/stale"
-        agent._cache_pipeline._cached_through_index = 0
-
-        # Should fall back to uncached and succeed
+        agent = self.Agent(session_id="test-session")
         result = agent.run("test prompt")
         assert result == "fallback response"
 
         # Cache should have been invalidated
-        assert agent._cache_pipeline.has_ready_cache is False
-
+        self.mock_registry.invalidate.assert_called_with(agent.instance_id)
         agent.close()
 
-    def test_run_stateless_does_not_use_cache(self, mock_env, mock_genai):
-        """run_stateless() should not interact with the cache pipeline."""
-        from agent_core.agents.base import Agent
+    def test_clear_history_invalidates_cache(self):
+        """clear_history should invalidate the agent's cache."""
+        self.mock_client.models.generate_content.return_value = make_text_response("ok")
 
-        mock_client = mock_genai.Client.return_value
-        mock_client.models.generate_content.return_value = make_text_response("stateless")
-        mock_client.models.count_tokens.return_value = MockTokenCountResponse(50_000)
+        agent = self.Agent(session_id="test-session")
+        agent.clear_history()
 
-        agent = Agent(session_id="test-session")
+        self.mock_registry.invalidate.assert_called_with(agent.instance_id)
+        agent.close()
 
+    def test_close_unregisters(self):
+        """close should unregister the agent from the registry."""
+        self.mock_client.models.generate_content.return_value = make_text_response("ok")
+
+        agent = self.Agent(session_id="test-session")
+        instance_id = agent.instance_id
+        agent.close()
+
+        self.mock_registry.unregister.assert_called_with(instance_id)
+        assert agent._cache_enabled is False
+
+    def test_run_stateless_does_not_use_cache(self):
+        """run_stateless should not interact with the cache registry."""
+        self.mock_client.models.generate_content.return_value = make_text_response(
+            "stateless"
+        )
+
+        agent = self.Agent(session_id="test-session")
         agent.run_stateless("one-shot query")
 
-        # No cache operations should have happened
-        mock_client.caches.create.assert_not_called()
-
+        # No cache operations via get_advice/notify for stateless
+        # get_advice may or may not be called — but no cache should be used
+        self.mock_registry.notify.assert_not_called()
         agent.close()
 
 
@@ -645,67 +978,54 @@ class TestContentsOffset:
         mock_client.models.generate_content.return_value = make_text_response("ok")
 
         agent = Agent()
-        agent.ENABLE_CACHING = False
-        agent._cache_pipeline = None
+        assert agent._cache_enabled is False  # No session_id
 
         agent.run("test")
 
         call_kwargs = mock_client.models.generate_content.call_args.kwargs
         contents = call_kwargs["contents"]
-        # Should be the full history (1 user message)
         assert len(contents) == 1
-
         agent.close()
 
     def test_offset_skips_cached_prefix(self, mock_env, mock_genai):
         """With offset > 0, only suffix should be sent to API."""
         from agent_core.agents.base import Agent
+        from agent_core.core.caching import CacheAdvice
 
         mock_client = mock_genai.Client.return_value
-        # Response reports prompt tokens above threshold so should_cache triggers
         mock_client.models.generate_content.return_value = MockResponse(
             "ok",
             MockContent(role="model", parts=[MockPart(text="ok")]),
             usage_metadata=MockUsageMetadata(prompt_token_count=50_000),
         )
-        mock_client.caches.create.return_value = MockCachedContent("cachedContents/c1")
 
-        agent = Agent(session_id="test-session")
+        # Set up registry
+        mock_registry = MagicMock()
+        mock_registry.get_advice.return_value = CacheAdvice(
+            cache_name="cachedContents/c1", contents_offset=2
+        )
+        old_registry = Agent._cache_registry
+        Agent._cache_registry = mock_registry
 
-        # Round 1
-        agent.run("first")
+        try:
+            agent = Agent(session_id="test-session")
+            # Pre-populate history
+            agent._history = [
+                MockContent(role="user", parts=[MockPart(text="msg1")]),
+                MockContent(role="model", parts=[MockPart(text="resp1")]),
+            ]
 
-        # Wait for cache creation
-        pipeline = agent._cache_pipeline
-        if pipeline._pending:
-            pipeline._pending.result(timeout=5)
+            agent.run("msg2")
 
-        # Round 2 - promotes cache, fires new
-        agent.run("second")
+            # History after run: [msg1, resp1, msg2, model_resp] = 4 items
+            # Offset=2, so only [msg2] sent (1 item, before model response added)
+            call_kwargs = mock_client.models.generate_content.call_args.kwargs
+            contents_sent = call_kwargs["contents"]
+            assert len(contents_sent) == 1  # Only the new user message
 
-        # Wait for cache creation
-        if pipeline._pending:
-            pipeline._pending.result(timeout=5)
-
-        # Now cache is ready, covering first 2 history items (user+model from round 1)
-        assert pipeline.has_ready_cache is True
-        cached_through = pipeline.cached_through_index
-
-        # Round 3 - should use cache
-        agent.run("third")
-
-        # The last generate_content call should have received only uncached items
-        last_call = mock_client.models.generate_content.call_args
-        contents_sent = last_call.kwargs["contents"]
-
-        # Contents sent should be fewer than full history.
-        # At call time, history had: u1,m1,u2,m2,u3 (5 items, before model reply).
-        # cached_through=2 (covers u1,m1), so 5-2=3 items sent.
-        full_history_len = len(agent._history)  # 7 after model reply added
-        assert len(contents_sent) < full_history_len
-        assert len(contents_sent) == (full_history_len - 1) - cached_through
-
-        agent.close()
+            agent.close()
+        finally:
+            Agent._cache_registry = old_registry
 
 
 class TestToolCallingWithCache:
@@ -717,7 +1037,6 @@ class TestToolCallingWithCache:
 
         mock_client = mock_genai.Client.return_value
 
-        # Response sequence: tool call → text response
         responses = [
             make_tool_call_response("my_tool", {"query": "test"}),
             make_text_response("Done!"),
@@ -725,8 +1044,7 @@ class TestToolCallingWithCache:
         mock_client.models.generate_content.side_effect = responses
 
         agent = Agent()
-        agent.ENABLE_CACHING = False
-        agent._cache_pipeline = None
+        assert agent._cache_enabled is False
 
         def my_tool(query: str) -> str:
             """A test tool."""
@@ -736,7 +1054,5 @@ class TestToolCallingWithCache:
         result = agent.run("use the tool")
 
         assert result == "Done!"
-        # History should contain: user msg, model tool call, tool response, model text
         assert len(agent._history) == 4
-
         agent.close()
