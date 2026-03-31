@@ -369,6 +369,16 @@ class ContextCacheRegistry:
 
         return True
 
+    def _convert_tools(self, tools: list[Callable]) -> list[types.Tool]:
+        """Convert Python callables to Tool declarations for the caching API."""
+        declarations = [
+            types.FunctionDeclaration.from_callable(
+                callable=f, client=self._client._api_client
+            )
+            for f in tools
+        ]
+        return [types.Tool(function_declarations=declarations)]
+
     def _fire_creation(
         self,
         slot: _CacheSlot,
@@ -386,6 +396,9 @@ class ContextCacheRegistry:
         model_name = slot.model_name
         api_ttl = self._api_ttl
         client = self._client
+        # Convert tools upfront (fast, in-memory) so the background
+        # thread sends serialized declarations, not raw callables.
+        converted_tools = self._convert_tools(tools) if tools else None
 
         def _create() -> str:
             cache = client.caches.create(
@@ -393,7 +406,7 @@ class ContextCacheRegistry:
                 config=types.CreateCachedContentConfig(
                     contents=contents,
                     system_instruction=system_instruction,
-                    tools=tools,
+                    tools=converted_tools,
                     ttl=api_ttl,
                 ),
             )

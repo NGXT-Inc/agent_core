@@ -194,8 +194,11 @@ class Agent:
         # Tools registry - maps function name to callable
         self._tools: dict[str, Callable] = {}
 
-        # Tool list for SDK (function declarations)
+        # Raw callables (for cache fingerprinting and cache creation conversion)
         self._tool_functions: list[Callable] = []
+
+        # Pre-converted tool declarations (avoids SDK re-converting on every API call)
+        self._tool_declarations: list[types.Tool] = []
 
         # Conversation persistence
         self._conversation_store = conversation_store
@@ -299,16 +302,24 @@ class Agent:
         """Register a tool function for this agent.
 
         The function should have type hints and a docstring.
-        The SDK will automatically convert it to a function declaration.
 
         Args:
             func: A callable with type hints and docstring.
         """
         tool_name = getattr(func, "__name__", str(func))
-        # Store both the wrapped version (for execution) and original (for SDK)
         wrapped = self._wrap_tool_with_events(func)
         self._tools[tool_name] = wrapped
-        self._tool_functions.append(func)  # SDK needs unwrapped for declarations
+        self._tool_functions.append(func)
+
+        # Pre-convert to SDK declaration (avoids re-conversion on every API call)
+        decl = types.FunctionDeclaration.from_callable(
+            callable=func, client=self.client._api_client
+        )
+        if not self._tool_declarations:
+            self._tool_declarations = [types.Tool(function_declarations=[decl])]
+        else:
+            self._tool_declarations[0].function_declarations.append(decl)
+
         if self._cache_enabled:
             self._cache_registry.invalidate(self.instance_id)
 
@@ -903,7 +914,11 @@ class Agent:
     def _cached_config(
         cache_name: str, temperature: float, max_output_tokens: int
     ) -> types.GenerateContentConfig:
-        """Build a config that uses a cached context."""
+        """Build a config that uses a cached context.
+
+        Tools and system_instruction are baked into the cache, so they
+        are not set here.
+        """
         return types.GenerateContentConfig(
             cached_content=cache_name,
             temperature=temperature,
@@ -921,7 +936,7 @@ class Agent:
             system_instruction=self.system_prompt,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
-            tools=self._tool_functions if self._tool_functions else None,
+            tools=self._tool_declarations if self._tool_declarations else None,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=True
             ),
