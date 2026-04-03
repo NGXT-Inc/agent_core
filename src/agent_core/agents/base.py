@@ -37,6 +37,7 @@ from agent_core.providers.types import LLMProvider, ParsedResponse, TokenUsage, 
 # Default model constants (can be overridden at class level)
 MODEL_PRO = "gemini-3.1-pro-preview"
 MODEL_FLASH = "gemini-3-flash-preview"
+MODEL_FLASH_LITE = "gemini-3.1-flash-lite-preview"
 
 
 _env_loaded = False
