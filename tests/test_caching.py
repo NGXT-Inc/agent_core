@@ -5,6 +5,7 @@ Tests are organized into:
 2. Agent + registry integration tests (full pipeline through run())
 """
 
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from unittest.mock import MagicMock, patch, call
@@ -583,6 +584,51 @@ class TestUnregister:
         finally:
             registry.close()
 
+    def test_unregister_does_not_hold_lock_during_pending_wait(self):
+        """Other threads can use the registry while unregister waits for a pending future."""
+        mock_client = MagicMock()
+        mock_client.caches.delete.return_value = None
+        registry = ContextCacheRegistry(mock_client, max_workers=2, cache_ttl_seconds=600)
+        try:
+            registry.register("agent-1", "test-model")
+            registry.register("agent-2", "test-model")
+
+            # Give agent-2 a ready cache so get_advice returns it
+            slot2 = registry._slots["agent-2"]
+            slot2.ready_name = "cachedContents/ready-2"
+            slot2.ready_offset = 3
+            slot2.ready_created_at = time.monotonic()
+            slot2.config_fingerprint = _compute_fingerprint(None, None)
+
+            # Create a blocking pending future for agent-1
+            block = threading.Event()
+            def slow_create():
+                block.wait(timeout=10)
+                return "cachedContents/slow"
+            registry._slots["agent-1"].pending = registry._executor.submit(slow_create)
+
+            # Start unregister in a thread — it will wait for the pending future
+            unregister_done = threading.Event()
+            def do_unregister():
+                registry.unregister("agent-1")
+                unregister_done.set()
+
+            t = threading.Thread(target=do_unregister)
+            t.start()
+            time.sleep(0.2)  # Let unregister start waiting
+
+            # This must NOT block — proves the lock is not held
+            advice = registry.get_advice("agent-2", None, None)
+            assert advice.cache_name == "cachedContents/ready-2"
+
+            # Unblock and clean up
+            block.set()
+            unregister_done.wait(timeout=5)
+            t.join(timeout=5)
+            assert unregister_done.is_set()
+        finally:
+            registry.close()
+
 
 class TestClose:
     """Test registry shutdown."""
@@ -609,6 +655,43 @@ class TestClose:
         registry = ContextCacheRegistry(mock_client, max_workers=1)
         registry.close()
         registry.close()  # Should not raise
+
+    def test_close_does_not_hold_lock_during_pending_wait(self):
+        """close() releases the lock before waiting for pending futures."""
+        mock_client = MagicMock()
+        mock_client.caches.delete.return_value = None
+        registry = ContextCacheRegistry(mock_client, max_workers=2, cache_ttl_seconds=600)
+
+        registry.register("agent-1", "test-model")
+
+        # Create a blocking pending future
+        block = threading.Event()
+        def slow_create():
+            block.wait(timeout=10)
+            return "cachedContents/slow"
+        registry._slots["agent-1"].pending = registry._executor.submit(slow_create)
+
+        # Start close() in a thread — it will wait for the pending future
+        close_done = threading.Event()
+        def do_close():
+            registry.close()
+            close_done.set()
+
+        t = threading.Thread(target=do_close)
+        t.start()
+        time.sleep(0.2)  # Let close() start waiting
+
+        # The lock should be released — verify by acquiring it
+        lock_acquired = registry._lock.acquire(timeout=1)
+        if lock_acquired:
+            registry._lock.release()
+        assert lock_acquired, "close() held the lock while waiting for pending futures"
+
+        # Unblock and clean up
+        block.set()
+        close_done.wait(timeout=5)
+        t.join(timeout=5)
+        assert close_done.is_set()
 
 
 class TestMultiAgent:
@@ -916,8 +999,8 @@ class TestAgentCachingIntegration:
 
         def generate_side_effect(**kwargs):
             call_count[0] += 1
-            config = kwargs.get("config")
-            if hasattr(config, "cached_content") and config.cached_content:
+            # First call uses cache (fails), second call is fallback (succeeds)
+            if call_count[0] == 1:
                 raise Exception("CachedContent not found")
             return make_text_response("fallback response")
 

@@ -10,8 +10,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-persistence = [
-    # SQLite is built-in, no extra deps needed
+openai = [
+    "openai>=1.0.0",
+]
+openai-tiktoken = [
+    "openai>=1.0.0",
+    "tiktoken>=0.5.0",
 ]
 
 [build-system]

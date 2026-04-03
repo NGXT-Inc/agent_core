@@ -1,43 +1,83 @@
-"""Base agent class with Gemini function-calling support.
+"""Base agent class with LLM function-calling support.
 
-Each agent is a Gemini model instance with:
+Each agent is an LLM instance with:
 - A specific system prompt defining its role
 - A set of tools (Python functions) it can call
 - Manual function calling loop with parallel execution support
+
+Supports multiple LLM backends via the LLMProvider protocol.
+Default backend is Gemini (Vertex AI) for backward compatibility.
 
 This module is designed to be extended without modification:
 - Override class attributes for configuration
 - Override hook methods for custom behavior
 - Inject custom ConversationStore for persistence
+- Inject a custom LLMProvider for non-Gemini models
 """
 
 import functools
 import logging
 import os
+import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Callable, ClassVar
 
 logger = logging.getLogger(__name__)
 
 from dotenv import find_dotenv, load_dotenv
 from google import genai
-from google.genai import types
 
 from agent_core.core.caching import ContextCacheRegistry
-from agent_core.core.events import EventType, EventStatus, emit_event
+from agent_core.core.events import EventBus, EventType, EventStatus, Event, get_event_bus, emit_event
 from agent_core.core.persistence import ConversationStoreProtocol, InMemoryConversationStore
-
-load_dotenv(find_dotenv(usecwd=True))
+from agent_core.providers.types import LLMProvider, ParsedResponse, TokenUsage, ToolCall
 
 # Default model constants (can be overridden at class level)
 MODEL_PRO = "gemini-3.1-pro-preview"
 MODEL_FLASH = "gemini-3-flash-preview"
 
-# Environment configuration
-GOOGLE_PROJECT_ID = os.environ.get("GOOGLE_PROJECT_ID")
-GOOGLE_LOCATION = os.environ.get("GOOGLE_LOCATION", "global")
+
+_env_loaded = False
+
+
+def _ensure_env() -> None:
+    """Load .env file once, lazily."""
+    global _env_loaded
+    if not _env_loaded:
+        load_dotenv(find_dotenv(usecwd=True))
+        _env_loaded = True
+
+
+def _resolve_env() -> tuple[str | None, str]:
+    """Resolve Google Cloud env vars, loading .env if present.
+
+    Called lazily on first Agent that needs auto-client creation,
+    not at import time.
+    """
+    _ensure_env()
+    project = os.environ.get("GOOGLE_PROJECT_ID")
+    location = os.environ.get("GOOGLE_LOCATION", "global")
+    return project, location
+
+
+# Backward-compatible lazy accessors. Downstream code does:
+#   from agent_core.agents.base import GOOGLE_PROJECT_ID, GOOGLE_LOCATION
+# and uses them inside functions (e.g., project=GOOGLE_PROJECT_ID).
+# Module __getattr__ resolves them to real strings on first access.
+_LAZY_ENV_VARS = {
+    "GOOGLE_PROJECT_ID": ("GOOGLE_PROJECT_ID", None),
+    "GOOGLE_LOCATION": ("GOOGLE_LOCATION", "global"),
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_ENV_VARS:
+        env_key, default = _LAZY_ENV_VARS[name]
+        _ensure_env()
+        return os.environ.get(env_key, default)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def generate_instance_id(
@@ -110,17 +150,14 @@ class Agent:
     # Default model (override per agent type)
     DEFAULT_MODEL: ClassVar[str] = MODEL_PRO
 
-    # Agent types that get deterministic instance IDs from session_id
-    # Add your root agent types here: Agent.ROOT_AGENT_TYPES.add("my_agent")
-    ROOT_AGENT_TYPES: ClassVar[set[str]] = {"designer", "analyst", "data_analyst"}
+    # Agent types that get deterministic instance IDs from session_id.
+    # Override in subclasses with a frozenset that includes your agent's name:
+    #   ROOT_AGENT_TYPES = frozenset({"my_agent", *Agent.ROOT_AGENT_TYPES})
+    ROOT_AGENT_TYPES: ClassVar[frozenset[str]] = frozenset({"designer", "analyst", "data_analyst"})
 
     # Tools that handle code execution (for special result formatting in events)
-    # Override or extend in subclasses as needed
-    CODE_TOOLS: ClassVar[set[str]] = {
-        "execute_code",
-        "write_and_execute_block",
-        "update_and_execute_block",
-    }
+    # Override in subclasses: e.g. CODE_TOOLS = {"execute_code"}
+    CODE_TOOLS: ClassVar[set[str]] = set()
 
     # Execution limits
     MAX_PARALLEL_TOOLS: ClassVar[int] = 10
@@ -144,7 +181,12 @@ class Agent:
         max_workers: int = 4,
         cache_ttl_seconds: int = 600,
     ) -> None:
-        """Initialize the shared cache registry. Call once at app startup."""
+        """Initialize the shared cache registry. Call once at app startup.
+
+        .. deprecated::
+            Prefer passing ``cache_registry`` to ``Agent.__init__()``
+            for per-agent-tree isolation.
+        """
         if cls._cache_registry is not None:
             cls._cache_registry.close()
         cls._cache_registry = ContextCacheRegistry(
@@ -153,7 +195,12 @@ class Agent:
 
     @classmethod
     def shutdown_cache_registry(cls) -> None:
-        """Shutdown the shared cache registry. Call once at app teardown."""
+        """Shutdown the shared cache registry. Call once at app teardown.
+
+        .. deprecated::
+            Prefer passing ``cache_registry`` to ``Agent.__init__()``
+            and managing its lifecycle directly.
+        """
         if cls._cache_registry:
             cls._cache_registry.close()
             cls._cache_registry = None
@@ -161,22 +208,56 @@ class Agent:
     def __init__(
         self,
         model_name: str | None = None,
+        client: genai.Client | None = None,
+        provider: LLMProvider | None = None,
         parent_agent: str | None = None,
         session_id: str | None = None,
         conversation_store: ConversationStoreProtocol | None = None,
+        cancel_event: threading.Event | None = None,
+        event_bus: EventBus | None = None,
+        cache_registry: ContextCacheRegistry | None = None,
     ):
         """Initialize the agent.
 
         Args:
             model_name: Model to use. Defaults to class DEFAULT_MODEL.
+            client: Optional pre-configured Gemini client. Wraps it in a
+                   GeminiProvider. Ignored if *provider* is given.
+            provider: Optional LLMProvider instance. Takes priority over
+                     *client*. If neither is given, a GeminiProvider is
+                     created from environment variables.
             parent_agent: Instance ID of the parent agent (for graph visualization).
             session_id: Optional session ID for deterministic instance ID generation
                        and conversation persistence.
             conversation_store: Optional persistence backend. If None and session_id
                               is provided, uses InMemoryConversationStore.
+            cancel_event: Optional shared threading.Event for cancellation.
+                         If provided, this agent shares the cancel signal with
+                         its parent — calling cancel() on either stops both.
+                         If None, the agent creates its own independent event.
+            event_bus: Optional EventBus instance. If None, uses the global
+                      singleton from get_event_bus(). Pass a custom instance
+                      to isolate event streams (e.g., in tests).
+            cache_registry: Optional ContextCacheRegistry instance. If None,
+                          falls back to the class-level _cache_registry.
+                          Pass a custom instance for per-agent-tree isolation.
         """
-        if not GOOGLE_PROJECT_ID:
-            raise ValueError("GOOGLE_PROJECT_ID must be set in environment or .env file")
+        from agent_core.providers.gemini import GeminiProvider
+
+        # Provider resolution: provider > client > auto-create from env
+        if provider is not None:
+            self._provider = provider
+        elif client is not None:
+            self._provider = GeminiProvider(client=client)
+        else:
+            project_id, location = _resolve_env()
+            if not project_id:
+                raise ValueError("GOOGLE_PROJECT_ID must be set in environment or .env file")
+            self._provider = GeminiProvider(
+                client=genai.Client(
+                    vertexai=True, project=project_id, location=location
+                )
+            )
 
         self.model_name = model_name or self.DEFAULT_MODEL
 
@@ -186,28 +267,23 @@ class Agent:
         # Store session_id for persistence
         self._session_id: str | None = session_id
 
-        # Initialize Gemini client
-        self.client = genai.Client(
-            vertexai=True, project=GOOGLE_PROJECT_ID, location=GOOGLE_LOCATION
-        )
-
         # Tools registry - maps function name to callable
         self._tools: dict[str, Callable] = {}
 
         # Raw callables (for cache fingerprinting and cache creation conversion)
         self._tool_functions: list[Callable] = []
 
-        # Pre-converted tool declarations (avoids SDK re-converting on every API call)
-        self._tool_declarations: list[types.Tool] = []
+        # Provider-specific tool declarations (built via provider.build_tool_schemas)
+        self._tool_schemas: Any | None = None
 
         # Conversation persistence
         self._conversation_store = conversation_store
         if session_id and self._conversation_store:
-            self._history: list[types.Content] = self._conversation_store.load(
+            self._history: list[Any] = self._conversation_store.load(
                 session_id, self.name
             )
         else:
-            self._history: list[types.Content] = []
+            self._history: list[Any] = []
 
         # Parent agent instance ID for event tracking (graph edges)
         self._parent_agent: str | None = parent_agent
@@ -215,10 +291,20 @@ class Agent:
         # Wave ID for grouping parallel agents in visualization
         self._wave_id: str | None = None
 
-        # Register with shared cache registry (only for persistent sessions —
+        # Cancellation support (thread-safe, shareable across agent tree)
+        self._owns_cancel_event = cancel_event is None
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
+
+        # Event bus (instance-level, falls back to global singleton)
+        self._event_bus = event_bus if event_bus is not None else get_event_bus()
+
+        # Cache registry (instance-level, falls back to class-level default)
+        self._instance_cache_registry = cache_registry if cache_registry is not None else self._cache_registry
+
+        # Register with cache registry (only for persistent sessions —
         # avoids overhead on short-lived sub-agents using run_stateless)
-        if self.ENABLE_CACHING and session_id and self._cache_registry:
-            self._cache_registry.register(
+        if self.ENABLE_CACHING and session_id and self._instance_cache_registry:
+            self._instance_cache_registry.register(
                 agent_id=self.instance_id,
                 model_name=self.model_name,
                 min_token_threshold=self.CACHE_MIN_TOKENS,
@@ -239,7 +325,13 @@ class Agent:
         """
         pass
 
-    def on_agent_end(self, result: str, success: bool, error: str | None = None) -> None:
+    def on_agent_end(
+        self,
+        result: str,
+        success: bool,
+        error: str | None = None,
+        cancelled: bool = False,
+    ) -> None:
         """Called when agent finishes processing.
 
         Override to add custom logging, cleanup, or metrics.
@@ -248,6 +340,7 @@ class Agent:
             result: The final result text (empty if failed).
             success: Whether processing completed successfully.
             error: Error message if failed.
+            cancelled: Whether the run was cancelled via cancel().
         """
         pass
 
@@ -296,6 +389,61 @@ class Agent:
         """
         pass
 
+    # --- Provider Access ---
+
+    @property
+    def client(self):
+        """The underlying Gemini client (backward compat).
+
+        Only available when using GeminiProvider.
+
+        Raises:
+            AttributeError: If the provider is not GeminiProvider.
+        """
+        from agent_core.providers.gemini import GeminiProvider
+        if isinstance(self._provider, GeminiProvider):
+            return self._provider.client
+        raise AttributeError(
+            f"'client' is only available with GeminiProvider, "
+            f"not {type(self._provider).__name__}"
+        )
+
+    # --- Event Emission ---
+
+    @property
+    def event_bus(self) -> EventBus:
+        """The event bus this agent emits to.
+
+        Use this in lifecycle hooks to emit custom events to the same
+        bus as the agent's built-in events::
+
+            def on_tool_end(self, tool_name, args, tool_call_id, result, success, error=None):
+                if tool_name == "add_papers":
+                    self.event_bus.emit(Event(
+                        type="papers_added",
+                        agent=self.instance_id,
+                        details={"count": len(result)},
+                    ))
+        """
+        return self._event_bus
+
+    def _emit_event(self, event_type, **kwargs) -> Event:
+        """Emit an event on this agent's event bus."""
+        event = Event(type=event_type, **kwargs)
+        self._event_bus.emit(event)
+        return event
+
+    # --- Cancellation ---
+
+    def cancel(self) -> None:
+        """Request cancellation of the current run.
+
+        Thread-safe. The agent will stop after completing any
+        in-progress tool executions. The run() or run_stateless()
+        call will return "[Cancelled]".
+        """
+        self._cancel_event.set()
+
     # --- Tool Registration ---
 
     def register_tool(self, func: Callable) -> None:
@@ -311,17 +459,39 @@ class Agent:
         self._tools[tool_name] = wrapped
         self._tool_functions.append(func)
 
-        # Pre-convert to SDK declaration (avoids re-conversion on every API call)
-        decl = types.FunctionDeclaration.from_callable(
-            callable=func, client=self.client._api_client
-        )
-        if not self._tool_declarations:
-            self._tool_declarations = [types.Tool(function_declarations=[decl])]
-        else:
-            self._tool_declarations[0].function_declarations.append(decl)
+        # Rebuild tool schemas via provider
+        self._tool_schemas = self._provider.build_tool_schemas(self._tool_functions)
 
         if self._cache_enabled:
-            self._cache_registry.invalidate(self.instance_id)
+            self._instance_cache_registry.invalidate(self.instance_id)
+
+    def unregister_tool(self, name: str) -> None:
+        """Remove a registered tool by name.
+
+        Args:
+            name: The function name of the tool to remove.
+
+        Raises:
+            KeyError: If no tool with this name is registered.
+        """
+        if name not in self._tools:
+            raise KeyError(f"No tool registered with name: {name}")
+
+        del self._tools[name]
+
+        self._tool_functions = [
+            f for f in self._tool_functions
+            if getattr(f, "__name__", str(f)) != name
+        ]
+
+        self._rebuild_tool_schemas()
+
+        if self._cache_enabled:
+            self._instance_cache_registry.invalidate(self.instance_id)
+
+    def _rebuild_tool_schemas(self) -> None:
+        """Rebuild tool schemas from current _tool_functions via provider."""
+        self._tool_schemas = self._provider.build_tool_schemas(self._tool_functions)
 
     def _wrap_tool_with_events(self, func: Callable) -> Callable:
         """Wrap a tool function to emit events and call hooks."""
@@ -351,15 +521,13 @@ class Agent:
             details = {"args_hint": args_hint} if args_hint else {}
             if full_code:
                 details["code"] = full_code
-            if "cell_index" in kwargs:
-                details["cell_index"] = kwargs["cell_index"]
 
             # Call hook
             self.on_tool_start(display_name, kwargs, tool_call_id)
 
             # Emit event if enabled
             if self.emit_tool_events:
-                emit_event(
+                self._emit_event(
                     EventType.TOOL_START,
                     agent=self.instance_id,
                     agent_type=self.name,
@@ -383,36 +551,17 @@ class Agent:
                     "result_type": result_type,
                 }
 
-                # For code tools, include full output details
-                if display_name in self.CODE_TOOLS and isinstance(result, dict):
-                    code_result_keys = [
-                        "code",
-                        "stdout",
-                        "stderr",
-                        "success",
-                        "valid",
-                        "error",
-                        "rich_outputs",
-                        "defined_variables",
-                        "cell_index",
-                        "description",
-                    ]
-                    for key in code_result_keys:
-                        if key in result:
-                            result_details[key] = result[key]
-
-                    result_details["cell_name"] = (
-                        result.get("cell_name")
-                        or result.get("notebook_cell_name")
-                        or f"cell_{tool_call_id}"
-                    )
+                # Let subclasses enrich event details for domain-specific tools
+                self._enrich_tool_event_details(
+                    display_name, result, result_details, tool_call_id
+                )
 
                 # Call hook
                 self.on_tool_end(display_name, kwargs, tool_call_id, result, success=True)
 
                 # Emit event if enabled
                 if self.emit_tool_events:
-                    emit_event(
+                    self._emit_event(
                         EventType.TOOL_END,
                         agent=self.instance_id,
                         agent_type=self.name,
@@ -433,7 +582,7 @@ class Agent:
 
                 # Emit event if enabled
                 if self.emit_tool_events:
-                    emit_event(
+                    self._emit_event(
                         EventType.TOOL_END,
                         agent=self.instance_id,
                         agent_type=self.name,
@@ -448,6 +597,36 @@ class Agent:
 
         return wrapper
 
+    # --- Tool Event Detail Enrichment ---
+
+    def _enrich_tool_event_details(
+        self,
+        tool_name: str,
+        result: Any,
+        details: dict,
+        tool_call_id: str,
+    ) -> None:
+        """Enrich TOOL_END event details with domain-specific data.
+
+        Override in subclasses to extract domain-specific fields from
+        tool results into event details. The base implementation is a no-op.
+
+        Example for a code execution agent::
+
+            def _enrich_tool_event_details(self, tool_name, result, details, tool_call_id):
+                if tool_name in self.CODE_TOOLS and isinstance(result, dict):
+                    for key in ("code", "stdout", "stderr", "success"):
+                        if key in result:
+                            details[key] = result[key]
+
+        Args:
+            tool_name: Name of the tool that executed.
+            result: The tool's return value.
+            details: Mutable dict to enrich — will be included in the event.
+            tool_call_id: Unique ID for this tool invocation.
+        """
+        pass
+
     # --- History Management ---
 
     def clear_history(self) -> None:
@@ -456,7 +635,7 @@ class Agent:
         if self._session_id and self._conversation_store:
             self._conversation_store.clear(self._session_id, self.name)
         if self._cache_enabled:
-            self._cache_registry.invalidate(self.instance_id)
+            self._instance_cache_registry.invalidate(self.instance_id)
 
     def _invalidate_cache(self) -> None:
         """Invalidate the context cache.
@@ -464,12 +643,12 @@ class Agent:
         Call after changing system_prompt or tools at runtime.
         """
         if self._cache_enabled:
-            self._cache_registry.invalidate(self.instance_id)
+            self._instance_cache_registry.invalidate(self.instance_id)
 
     def close(self) -> None:
         """Clean up agent resources (unregisters from cache registry)."""
         if self._cache_enabled:
-            self._cache_registry.unregister(self.instance_id)
+            self._instance_cache_registry.unregister(self.instance_id)
             self._cache_enabled = False
 
     def __del__(self):
@@ -486,7 +665,11 @@ class Agent:
     # --- Result Summarization ---
 
     def _summarize_result(self, result: Any, max_length: int = 200) -> str:
-        """Create a short summary of tool result for UI display."""
+        """Create a short summary of tool result for UI display.
+
+        Override in subclasses for domain-specific summarization
+        (e.g., code execution results with defined_variables).
+        """
         if result is None:
             return "None"
 
@@ -494,19 +677,6 @@ class Agent:
             if result.get("error"):
                 error_msg = str(result["error"])[:100]
                 return f"Error: {error_msg}"
-
-            if "success" in result and "defined_variables" in result:
-                if result.get("success"):
-                    vars_defined = result.get("defined_variables", [])
-                    stdout = result.get("stdout", "").strip()
-                    if stdout:
-                        first_line = stdout.split("\n")[0][:80]
-                        return f"Success: {first_line}"
-                    elif vars_defined:
-                        return f"Success: defined {', '.join(vars_defined[:5])}"
-                    return "Success"
-                else:
-                    return f"Failed: {result.get('error_type', 'Unknown error')}"
 
             if "text" in result:
                 text = str(result["text"])
@@ -551,27 +721,11 @@ class Agent:
         Returns a dict with system prompt and conversation history,
         useful for debugging and visibility into agent state.
         """
-        history_formatted = []
-        for content in self._history:
-            role = content.role
-            parts_text = []
-            for part in content.parts:
-                if hasattr(part, "text") and part.text:
-                    parts_text.append(part.text)
-                elif hasattr(part, "function_call") and part.function_call:
-                    fc = part.function_call
-                    parts_text.append(f"[Tool Call: {fc.name}({dict(fc.args) if fc.args else {}})]")
-                elif hasattr(part, "function_response") and part.function_response:
-                    fr = part.function_response
-                    parts_text.append(f"[Tool Response: {fr.name} -> {fr.response}]")
-
-            if parts_text:
-                history_formatted.append(
-                    {
-                        "role": role,
-                        "content": "\n".join(parts_text),
-                    }
-                )
+        history_formatted = [
+            entry
+            for msg in self._history
+            if (entry := self._provider.format_message_for_display(msg)) is not None
+        ]
 
         tool_names = list(self._tools.keys())
         context_tokens = self._count_context_tokens()
@@ -588,28 +742,18 @@ class Agent:
     def _count_context_tokens(self) -> int:
         """Count tokens in the current context window."""
         try:
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=self.system_prompt)],
-                )
-            ]
-            contents.extend(self._history)
-
-            response = self.client.models.count_tokens(
-                model=self.model_name,
-                contents=contents,
+            return self._provider.count_tokens(
+                self.model_name, self._history, self.system_prompt
             )
-            return response.total_tokens
         except Exception:
             return 0
 
     # --- Tool Execution ---
 
-    def _execute_tool(self, function_call: types.FunctionCall) -> tuple[str, Any]:
+    def _execute_tool(self, tool_call: ToolCall) -> tuple[str, Any]:
         """Execute a single tool and return (name, result)."""
-        func_name = function_call.name
-        args = dict(function_call.args) if function_call.args else {}
+        func_name = tool_call.name
+        args = tool_call.args
 
         tool_func = self._tools.get(func_name)
         if not tool_func:
@@ -619,119 +763,51 @@ class Agent:
             result = tool_func(**args)
             return func_name, result
         except Exception as e:
+            logger.exception("Tool %s raised an exception", func_name)
             return func_name, {"error": str(e)}
 
     def _execute_tools_parallel(
-        self, function_calls: list[types.FunctionCall]
+        self, tool_calls: list[ToolCall]
     ) -> list[tuple[str, Any]]:
-        """Execute multiple tool calls in parallel."""
-        if len(function_calls) == 1:
-            return [self._execute_tool(function_calls[0])]
+        """Execute multiple tool calls in parallel.
 
-        results = [None] * len(function_calls)
+        Checks ``_cancel_event`` between completions so a hung tool
+        doesn't block cancellation indefinitely.  Completed results are
+        always collected; cancelled/pending tools get an error placeholder.
+        """
+        results: list[tuple[str, Any] | None] = [None] * len(tool_calls)
+
         with ThreadPoolExecutor(
-            max_workers=min(len(function_calls), self.MAX_PARALLEL_TOOLS)
+            max_workers=min(len(tool_calls), self.MAX_PARALLEL_TOOLS)
         ) as executor:
             future_to_idx = {
-                executor.submit(self._execute_tool, fc): idx
-                for idx, fc in enumerate(function_calls)
+                executor.submit(self._execute_tool, tc): idx
+                for idx, tc in enumerate(tool_calls)
             }
 
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    func_name = function_calls[idx].name
-                    results[idx] = (func_name, {"error": str(e)})
+            remaining = set(future_to_idx.keys())
+            while remaining:
+                # Poll with short timeout so we can check cancellation
+                done, remaining = wait(remaining, timeout=0.5, return_when=FIRST_COMPLETED)
+
+                for future in done:
+                    idx = future_to_idx[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        func_name = tool_calls[idx].name
+                        results[idx] = (func_name, {"error": str(e)})
+
+                if self._cancel_event.is_set() and remaining:
+                    # Cancel pending futures and fill placeholders
+                    for future in remaining:
+                        future.cancel()
+                        idx = future_to_idx[future]
+                        func_name = tool_calls[idx].name
+                        results[idx] = (func_name, {"error": "Cancelled"})
+                    break
 
         return results
-
-    def _build_function_response_content(self, results: list[tuple[str, Any]]) -> types.Content:
-        """Build a Content object with function response parts.
-
-        Supports multimodal responses - if a tool result contains a "files"
-        key with file attachments, they are included as Parts in the response.
-
-        Two attachment modes are supported:
-
-        1. **Inline bytes** - Include raw binary data directly:
-            {"data": bytes, "mime_type": "application/pdf", "description": "..."}
-
-        2. **GCS URI** - Reference a file in Google Cloud Storage:
-            {"gcs_uri": "gs://bucket/path.pdf", "mime_type": "application/pdf", "description": "..."}
-
-        GCS mode is preferred for large files (>10MB) to avoid context limits.
-
-        Expected format:
-            {
-                "result": "...",
-                "files": [
-                    {"data": bytes, "mime_type": "image/png", "description": "Chart"},
-                    {"gcs_uri": "gs://bucket/paper.pdf", "mime_type": "application/pdf", "description": "Paper"},
-                ]
-            }
-
-        Note: The legacy "images" key is still supported for backward compatibility.
-        """
-        parts = []
-        for func_name, result in results:
-            file_attachments = []
-            if isinstance(result, dict):
-                # Support both "files" (preferred) and "images" (legacy) keys
-                file_attachments = result.pop("files", []) or []
-                file_attachments += result.pop("images", []) or []
-                response_data = result
-            else:
-                response_data = {"result": str(result)}
-
-            parts.append(
-                types.Part.from_function_response(
-                    name=func_name,
-                    response=response_data,
-                )
-            )
-
-            for item in file_attachments:
-                if not isinstance(item, dict):
-                    continue
-
-                mime_type = item.get("mime_type", "application/octet-stream")
-                description = item.get("description", "")
-
-                # Add description as text part if provided
-                if description:
-                    label = "PDF" if mime_type == "application/pdf" else "File"
-                    parts.append(
-                        types.Part.from_text(text=f"[{label} from {func_name}: {description}]")
-                    )
-
-                # Check for GCS URI first (preferred for large files)
-                if "gcs_uri" in item:
-                    gcs_uri = item["gcs_uri"]
-                    parts.append(
-                        types.Part.from_uri(
-                            file_uri=gcs_uri,
-                            mime_type=mime_type,
-                        )
-                    )
-                    logger.debug(f"Attached GCS file to context: {gcs_uri} ({mime_type})")
-
-                # Fall back to inline bytes
-                elif "data" in item:
-                    item_data = item["data"]
-                    parts.append(
-                        types.Part.from_bytes(
-                            data=item_data,
-                            mime_type=mime_type,
-                        )
-                    )
-                    logger.debug(
-                        f"Attached inline {mime_type} to context: "
-                        f"{description or func_name} ({len(item_data):,} bytes)"
-                    )
-
-        return types.Content(role="user", parts=parts)
 
     # --- Retry Logic ---
 
@@ -741,23 +817,26 @@ class Agent:
     RETRY_MAX_DELAY: ClassVar[float] = 60.0    # seconds
 
     def _generate_with_retry(self, **kwargs):
-        """Call generate_content with exponential backoff on 429 errors."""
-        from google.genai.errors import ClientError
+        """Call provider.generate with exponential backoff on retryable errors.
 
+        Checks _cancel_event during backoff so cancellation is responsive
+        even during retry waits.
+        """
         for attempt in range(1, self.RETRY_MAX_ATTEMPTS + 1):
             try:
-                return self.client.models.generate_content(**kwargs)
-            except ClientError as e:
-                if e.code == 429 and attempt < self.RETRY_MAX_ATTEMPTS:
-                    delay = min(
-                        self.RETRY_BASE_DELAY * (2 ** (attempt - 1)),
-                        self.RETRY_MAX_DELAY,
+                return self._provider.generate(**kwargs)
+            except Exception as e:
+                if self._provider.is_retryable_error(e) and attempt < self.RETRY_MAX_ATTEMPTS:
+                    delay = self._provider.get_retry_delay(
+                        e, attempt, self.RETRY_BASE_DELAY, self.RETRY_MAX_DELAY,
                     )
                     logger.warning(
-                        "[%s] 429 quota exhausted (attempt %d/%d), retrying in %.1fs",
-                        self.name, attempt, self.RETRY_MAX_ATTEMPTS, delay,
+                        "[%s] Retryable error (attempt %d/%d), retrying in %.1fs: %s",
+                        self.name, attempt, self.RETRY_MAX_ATTEMPTS, delay, e,
                     )
-                    time.sleep(delay)
+                    # Use cancel event as sleep — wakes immediately on cancel
+                    if self._cancel_event.wait(timeout=delay):
+                        return None  # Caller checks cancel_event
                 else:
                     raise
 
@@ -765,213 +844,249 @@ class Agent:
 
     def _run_with_function_loop(
         self,
-        contents: list[types.Content],
-        config: types.GenerateContentConfig,
-        contents_offset: int = 0,
+        contents: list[Any],
+        temperature: float,
+        max_output_tokens: int,
+        cache_config: dict | None = None,
+        save_history: bool = True,
     ) -> tuple[str, dict]:
         """Run the model with manual function calling loop.
 
         Args:
             contents: Full conversation history (appended to during loop).
-            config: Generation config (may include cached_content).
-            contents_offset: Number of leading items covered by cache.
-                Only contents[contents_offset:] is sent to generate_content.
+            temperature: Sampling temperature.
+            max_output_tokens: Maximum tokens in response.
+            cache_config: Optional caching hints for the provider.
+                Gemini uses ``{"cache_name": str, "contents_offset": int}``.
+            save_history: Whether to persist history after each append.
+                True for stateful run(), False for run_stateless().
         """
         iteration = 0
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        total_cached_tokens = 0
-        last_prompt_token_count = 0
+        total = TokenUsage()
+        last_prompt = 0
+
+        def _usage_dict() -> dict:
+            offset = (cache_config or {}).get("contents_offset", 0)
+            return {
+                "prompt_tokens": total.prompt_tokens,
+                "completion_tokens": total.completion_tokens,
+                "total_tokens": total.prompt_tokens + total.completion_tokens,
+                "cached_tokens": total.cached_tokens,
+                "cache_type": (
+                    ("explicit" if offset > 0 else "implicit")
+                    if total.cached_tokens else None
+                ),
+                "last_prompt_token_count": last_prompt,
+                "model": self.model_name,
+            }
 
         while iteration < self.MAX_ITERATIONS:
             iteration += 1
 
-            response = self._generate_with_retry(
+            # Check for cancellation before each API call
+            if self._cancel_event.is_set():
+                return "[Cancelled]", _usage_dict()
+
+            raw_response = self._generate_with_retry(
                 model=self.model_name,
-                contents=contents[contents_offset:],
-                config=config,
+                messages=contents,
+                system_prompt=self.system_prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+                tool_schemas=self._tool_schemas,
+                cache_config=cache_config,
             )
 
-            if hasattr(response, "usage_metadata") and response.usage_metadata:
-                meta = response.usage_metadata
-                last_prompt_token_count = getattr(meta, "prompt_token_count", 0) or 0
-                total_prompt_tokens += last_prompt_token_count
-                total_completion_tokens += getattr(meta, "candidates_token_count", 0) or 0
-                cached = getattr(meta, "cached_content_token_count", 0) or 0
-                total_cached_tokens += cached
-                cache_label = "explicit" if contents_offset > 0 else "implicit"
-                pct = cached * 100 // max(last_prompt_token_count, 1) if cached else 0
+            # None means cancelled during retry backoff
+            if raw_response is None:
+                return "[Cancelled]", _usage_dict()
+
+            parsed = self._provider.parse_response(raw_response)
+
+            # Accumulate usage
+            last_prompt = parsed.usage.prompt_tokens
+            total.prompt_tokens += parsed.usage.prompt_tokens
+            total.completion_tokens += parsed.usage.completion_tokens
+            total.cached_tokens += parsed.usage.cached_tokens
+
+            if last_prompt:
+                offset = (cache_config or {}).get("contents_offset", 0)
+                cache_label = "explicit" if offset > 0 else "implicit"
+                pct = (
+                    parsed.usage.cached_tokens * 100 // max(last_prompt, 1)
+                    if parsed.usage.cached_tokens else 0
+                )
                 logger.info(
                     "[%s] iter=%d cache=%s: %d cached / %d prompt tokens (%d%%)",
                     self.name, iteration, cache_label,
-                    cached, last_prompt_token_count, pct,
+                    parsed.usage.cached_tokens, last_prompt, pct,
                 )
 
-            token_usage = {
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": total_prompt_tokens + total_completion_tokens,
-                "cached_tokens": total_cached_tokens,
-                "cache_type": (
-                    ("explicit" if contents_offset > 0 else "implicit")
-                    if total_cached_tokens else None
-                ),
-                "last_prompt_token_count": last_prompt_token_count,
-                "model": self.model_name,
-            }
-
-            if not response.candidates or not response.candidates[0].content:
-                return response.text or "", token_usage
-
-            model_content = response.candidates[0].content
-
-            text_parts = []
-            function_calls = []
-            for part in model_content.parts:
-                if hasattr(part, "function_call") and part.function_call:
-                    function_calls.append(part.function_call)
-                elif hasattr(part, "text") and part.text:
-                    text_parts.append(part.text)
-
-            # Emit intermediate text if present alongside tool calls
-            if text_parts and function_calls:
-                combined_text = "\n".join(text_parts)
-
-                # Call hook
-                self.on_model_thinking(combined_text)
-
-                # Emit event if enabled
+            # Emit intermediate thinking text alongside tool calls
+            if parsed.thinking_text and parsed.tool_calls:
+                self.on_model_thinking(parsed.thinking_text)
                 if self.emit_lifecycle_events:
-                    emit_event(
+                    self._emit_event(
                         EventType.MODEL_THINKING,
                         agent=self.instance_id,
                         agent_type=self.name,
                         parent_agent=self._parent_agent,
                         wave_id=self._wave_id,
-                        details={"text": combined_text},
+                        details={"text": parsed.thinking_text},
                     )
 
-            if not function_calls:
-                contents.append(model_content)
+            if not parsed.tool_calls:
+                # Final text response
+                if parsed.raw_message is not None:
+                    contents.append(parsed.raw_message)
+                if save_history:
+                    self._save_history()
+                return parsed.text or "", _usage_dict()
+
+            # Append the model's tool-calling message
+            if parsed.raw_message is not None:
+                contents.append(parsed.raw_message)
+            if save_history:
                 self._save_history()
-                return response.text or "", token_usage
 
-            contents.append(model_content)
-            self._save_history()
+            # Execute tools
+            results = self._execute_tools_parallel(parsed.tool_calls)
 
-            results = self._execute_tools_parallel(function_calls)
+            # Build and append tool result messages
+            tool_msgs = self._provider.build_tool_result_messages(
+                parsed.tool_calls, results,
+            )
+            if isinstance(tool_msgs, list):
+                contents.extend(tool_msgs)
+            else:
+                contents.append(tool_msgs)
+            if save_history:
+                self._save_history()
 
-            function_response_content = self._build_function_response_content(results)
-            contents.append(function_response_content)
-            self._save_history()
+            # Check for cancellation after tool execution
+            if self._cancel_event.is_set():
+                return "[Cancelled]", _usage_dict()
 
             # Mid-loop: notify registry (may fire new cache) and re-query
             if self._cache_enabled:
-                self._cache_registry.notify(
+                self._instance_cache_registry.notify(
                     self.instance_id,
                     contents,
                     self.system_prompt,
                     self._tool_functions or None,
-                    token_count=last_prompt_token_count,
+                    token_count=last_prompt,
                 )
-                advice = self._cache_registry.get_advice(
+                advice = self._instance_cache_registry.get_advice(
                     self.instance_id, self.system_prompt, self._tool_functions
                 )
                 if advice.cache_name:
-                    contents_offset = advice.contents_offset
-                    config = self._cached_config(
-                        advice.cache_name, config.temperature, config.max_output_tokens
+                    cache_config = {
+                        "cache_name": advice.cache_name,
+                        "contents_offset": advice.contents_offset,
+                    }
+                    logger.debug(
+                        "Mid-loop cache switch: offset=%d",
+                        advice.contents_offset,
                     )
-                    logger.debug("Mid-loop cache switch: offset=%d", contents_offset)
 
-            # Emit context update (use token count from response metadata
-            # instead of making a separate count_tokens API call)
+            # Emit context update
             if self.emit_lifecycle_events:
-                emit_event(
+                self._emit_event(
                     EventType.CONTEXT_UPDATE,
                     agent=self.instance_id,
                     agent_type=self.name,
                     parent_agent=self._parent_agent,
                     wave_id=self._wave_id,
-                    details={"context_tokens": last_prompt_token_count},
+                    details={"context_tokens": last_prompt},
                 )
 
-        token_usage = {
-            "prompt_tokens": total_prompt_tokens,
-            "completion_tokens": total_completion_tokens,
-            "total_tokens": total_prompt_tokens + total_completion_tokens,
-            "cached_tokens": total_cached_tokens,
-            "model": self.model_name,
-            "cache_type": (
-                ("explicit" if contents_offset > 0 else "implicit")
-                if total_cached_tokens else None
-            ),
-            "last_prompt_token_count": last_prompt_token_count,
-        }
-        return f"[Max iterations ({self.MAX_ITERATIONS}) reached]", token_usage
+        return f"[Max iterations ({self.MAX_ITERATIONS}) reached]", _usage_dict()
 
-    @staticmethod
-    def _cached_config(
-        cache_name: str, temperature: float, max_output_tokens: int
-    ) -> types.GenerateContentConfig:
-        """Build a config that uses a cached context.
-
-        Tools and system_instruction are baked into the cache, so they
-        are not set here.
-        """
-        return types.GenerateContentConfig(
-            cached_content=cache_name,
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                disable=True
-            ),
-        )
-
-    def _build_base_config(
-        self, temperature: float, max_output_tokens: int
-    ) -> types.GenerateContentConfig:
-        """Build a config without caching."""
-        return types.GenerateContentConfig(
-            system_instruction=self.system_prompt,
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-            tools=self._tool_declarations if self._tool_declarations else None,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                disable=True
-            ),
-        )
-
-    def _build_generate_config(
+    def _build_cache_config(
         self,
-        temperature: float,
-        max_output_tokens: int,
         wait_for_cache: bool = False,
-    ) -> tuple[types.GenerateContentConfig, int]:
-        """Query cache registry and return (config, contents_offset).
-
-        If a cache is available, returns a cached config with the
-        appropriate offset. Otherwise returns the base config with offset 0.
+    ) -> dict | None:
+        """Query cache registry and return cache_config dict or None.
 
         Args:
-            temperature: Sampling temperature.
-            max_output_tokens: Maximum tokens in response.
             wait_for_cache: If True, block until any pending cache creation
-                completes before returning. Guarantees a cache hit when a
-                cache was recently submitted.
+                completes before returning.
         """
-        if self._cache_enabled:
-            advice = self._cache_registry.get_advice(
-                self.instance_id, self.system_prompt, self._tool_functions,
-                wait=wait_for_cache,
+        if not self._cache_enabled:
+            return None
+        advice = self._instance_cache_registry.get_advice(
+            self.instance_id, self.system_prompt, self._tool_functions,
+            wait=wait_for_cache,
+        )
+        if advice.cache_name:
+            return {
+                "cache_name": advice.cache_name,
+                "contents_offset": advice.contents_offset,
+            }
+        return None
+
+    # --- Run Execution ---
+
+    _CANCELLED_RESULT = "[Cancelled]"
+
+    def _execute_run(self, prompt: str, execute_fn: Callable[[], tuple[str, dict]]) -> str:
+        """Shared execution wrapper for run() and run_stateless().
+
+        Handles: cancel-clear, hooks, event emission, error handling.
+
+        Args:
+            prompt: The prompt string (for hooks and events).
+            execute_fn: Callable that runs the actual generation loop
+                       and returns (result_text, token_usage).
+        """
+        if self._owns_cancel_event:
+            self._cancel_event.clear()
+
+        self.on_agent_start(prompt)
+
+        if self.emit_lifecycle_events:
+            self._emit_event(
+                EventType.AGENT_START,
+                agent=self.instance_id,
+                agent_type=self.name,
+                parent_agent=self._parent_agent,
+                wave_id=self._wave_id,
+                details={"prompt": prompt, "model": self.model_name},
             )
-            if advice.cache_name:
-                return (
-                    self._cached_config(advice.cache_name, temperature, max_output_tokens),
-                    advice.contents_offset,
+
+        try:
+            result, token_usage = execute_fn()
+            was_cancelled = result == self._CANCELLED_RESULT
+
+            self.on_agent_end(result, success=not was_cancelled, cancelled=was_cancelled)
+
+            if self.emit_lifecycle_events:
+                self._emit_event(
+                    EventType.AGENT_END,
+                    agent=self.instance_id,
+                    agent_type=self.name,
+                    status=EventStatus.COMPLETED,
+                    parent_agent=self._parent_agent,
+                    wave_id=self._wave_id,
+                    details={"result": result, "token_usage": token_usage},
                 )
 
-        return self._build_base_config(temperature, max_output_tokens), 0
+            return result
+
+        except Exception as e:
+            self.on_agent_end("", success=False, error=str(e))
+
+            if self.emit_lifecycle_events:
+                self._emit_event(
+                    EventType.AGENT_END,
+                    agent=self.instance_id,
+                    agent_type=self.name,
+                    status=EventStatus.FAILED,
+                    parent_agent=self._parent_agent,
+                    wave_id=self._wave_id,
+                    details={"error": str(e)},
+                )
+            raise
 
     def run(
         self,
@@ -993,52 +1108,30 @@ class Agent:
         Returns:
             The agent's final text response.
         """
-        # Call hook
-        self.on_agent_start(prompt)
 
-        # Emit event if enabled
-        if self.emit_lifecycle_events:
-            emit_event(
-                EventType.AGENT_START,
-                agent=self.instance_id,
-                agent_type=self.name,
-                parent_agent=self._parent_agent,
-                wave_id=self._wave_id,
-                details={"prompt": prompt, "model": self.model_name},
-            )
-
-        try:
-            user_content = types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=prompt)],
-            )
-            self._history.append(user_content)
+        def _execute() -> tuple[str, dict]:
+            self._history.append(self._provider.build_user_message(prompt))
             self._save_history()
 
-            # Query cache registry for best available cache
-            config, contents_offset = self._build_generate_config(
-                temperature, max_output_tokens, wait_for_cache=wait_for_cache
-            )
+            cache_config = self._build_cache_config(wait_for_cache=wait_for_cache)
 
             try:
                 result, token_usage = self._run_with_function_loop(
-                    self._history, config, contents_offset=contents_offset,
+                    self._history, temperature, max_output_tokens,
+                    cache_config=cache_config,
                 )
             except Exception as e:
-                # If we were using a cache and it failed, fall back to uncached
-                if contents_offset > 0 and self._cache_enabled:
+                if cache_config and self._cache_enabled:
                     logger.warning("Cached call failed, falling back: %s", e)
-                    self._cache_registry.invalidate(self.instance_id)
-                    base_config = self._build_base_config(temperature, max_output_tokens)
+                    self._instance_cache_registry.invalidate(self.instance_id)
                     result, token_usage = self._run_with_function_loop(
-                        self._history, base_config
+                        self._history, temperature, max_output_tokens,
                     )
                 else:
                     raise
 
-            # Notify cache registry: history has grown
             if self._cache_enabled:
-                self._cache_registry.notify(
+                self._instance_cache_registry.notify(
                     self.instance_id,
                     self._history,
                     self.system_prompt,
@@ -1046,39 +1139,9 @@ class Agent:
                     token_count=token_usage.get("last_prompt_token_count"),
                 )
 
-            # Call hook
-            self.on_agent_end(result, success=True)
+            return result, token_usage
 
-            # Emit event if enabled
-            if self.emit_lifecycle_events:
-                emit_event(
-                    EventType.AGENT_END,
-                    agent=self.instance_id,
-                    agent_type=self.name,
-                    status=EventStatus.COMPLETED,
-                    parent_agent=self._parent_agent,
-                    wave_id=self._wave_id,
-                    details={"result": result, "token_usage": token_usage},
-                )
-
-            return result
-
-        except Exception as e:
-            # Call hook
-            self.on_agent_end("", success=False, error=str(e))
-
-            # Emit event if enabled
-            if self.emit_lifecycle_events:
-                emit_event(
-                    EventType.AGENT_END,
-                    agent=self.instance_id,
-                    agent_type=self.name,
-                    status=EventStatus.FAILED,
-                    parent_agent=self._parent_agent,
-                    wave_id=self._wave_id,
-                    details={"error": str(e)},
-                )
-            raise
+        return self._execute_run(prompt, _execute)
 
     def run_stateless(
         self,
@@ -1105,65 +1168,13 @@ class Agent:
             context_str = "\n".join(f"{k}: {v}" for k, v in context.items())
             full_prompt = f"Context:\n{context_str}\n\nTask: {prompt}"
 
-        # Call hook
-        self.on_agent_start(full_prompt)
-
-        # Emit event if enabled
-        if self.emit_lifecycle_events:
-            emit_event(
-                EventType.AGENT_START,
-                agent=self.instance_id,
-                agent_type=self.name,
-                parent_agent=self._parent_agent,
-                wave_id=self._wave_id,
-                details={"prompt": full_prompt, "model": self.model_name},
+        def _execute() -> tuple[str, dict]:
+            contents = [self._provider.build_user_message(full_prompt)]
+            return self._run_with_function_loop(
+                contents, temperature, max_output_tokens, save_history=False,
             )
 
-        try:
-            config = self._build_base_config(temperature, max_output_tokens)
-
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=full_prompt)],
-                )
-            ]
-
-            result, token_usage = self._run_with_function_loop(contents, config)
-
-            # Call hook
-            self.on_agent_end(result, success=True)
-
-            # Emit event if enabled
-            if self.emit_lifecycle_events:
-                emit_event(
-                    EventType.AGENT_END,
-                    agent=self.instance_id,
-                    agent_type=self.name,
-                    status=EventStatus.COMPLETED,
-                    parent_agent=self._parent_agent,
-                    wave_id=self._wave_id,
-                    details={"result": result, "token_usage": token_usage},
-                )
-
-            return result
-
-        except Exception as e:
-            # Call hook
-            self.on_agent_end("", success=False, error=str(e))
-
-            # Emit event if enabled
-            if self.emit_lifecycle_events:
-                emit_event(
-                    EventType.AGENT_END,
-                    agent=self.instance_id,
-                    agent_type=self.name,
-                    status=EventStatus.FAILED,
-                    parent_agent=self._parent_agent,
-                    wave_id=self._wave_id,
-                    details={"error": str(e)},
-                )
-            raise
+        return self._execute_run(full_prompt, _execute)
 
 
 def agent_as_tool(agent: Agent, description: str | None = None) -> Callable:

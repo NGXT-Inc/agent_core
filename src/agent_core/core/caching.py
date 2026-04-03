@@ -123,14 +123,14 @@ class ContextCacheRegistry:
 
     def unregister(self, agent_id: str) -> None:
         """Remove agent slot and delete its remote caches."""
-        names_to_delete: list[str] = []
         with self._lock:
             slot = self._slots.pop(agent_id, None)
-            if slot is None:
-                return
-            names_to_delete = self._collect_cache_names(slot, wait_for_pending=True)
+        if slot is None:
+            return
 
-        # Delete outside lock (I/O)
+        # Collect names outside lock — may block waiting for pending futures
+        names_to_delete = self._collect_cache_names(slot, wait_for_pending=True)
+
         for name in names_to_delete:
             self._delete_cache(name)
         logger.debug("Unregistered cache slot for %s", agent_id)
@@ -277,12 +277,15 @@ class ContextCacheRegistry:
         """Shutdown: delete all remote caches, stop executor and reaper."""
         self._reaper_stop.set()
 
-        all_names: list[str] = []
         with self._lock:
             self._closed = True
-            for slot in self._slots.values():
-                all_names.extend(self._collect_cache_names(slot, wait_for_pending=True))
+            slots = list(self._slots.values())
             self._slots.clear()
+
+        # Collect names outside lock — may block waiting for pending futures
+        all_names: list[str] = []
+        for slot in slots:
+            all_names.extend(self._collect_cache_names(slot, wait_for_pending=True))
 
         for name in all_names:
             self._delete_cache(name)
@@ -425,11 +428,14 @@ class ContextCacheRegistry:
         """Collect cache names from a slot for deletion.
 
         Args:
-            slot: The cache slot to drain.
+            slot: The cache slot to drain. Must already be removed from
+                ``_slots`` so no other thread can reference it.
             wait_for_pending: If True, wait up to 5s for an in-flight
                 pending future so we can delete the resulting cache.
                 If False, just cancel it.
-        Must be called with _lock held.
+
+        Note: When ``wait_for_pending=True`` this method may block.
+        Call outside ``_lock`` to avoid stalling other registry operations.
         """
         names: list[str] = []
         if slot.pending is not None:

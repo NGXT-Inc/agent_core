@@ -24,8 +24,7 @@ class TestAgentInit:
         """Should raise if GOOGLE_PROJECT_ID is not set."""
         from agent_core.agents.base import Agent
 
-        with patch.dict(os.environ, {}, clear=True), \
-             patch("agent_core.agents.base.GOOGLE_PROJECT_ID", None):
+        with patch.dict(os.environ, {"GOOGLE_PROJECT_ID": ""}, clear=True):
             with pytest.raises(ValueError, match="GOOGLE_PROJECT_ID"):
                 Agent()
 
@@ -71,6 +70,23 @@ class TestAgentInit:
         agent = Agent()
         assert agent._history == []
         agent.close()
+
+    def test_injected_client_used(self, mock_client):
+        """Should use the injected client and not create a new one."""
+        from agent_core.agents.base import Agent
+
+        agent = Agent(client=mock_client)
+        assert agent.client is mock_client
+        agent.close()
+
+    def test_injected_client_skips_project_id_check(self, mock_client):
+        """Should not require GOOGLE_PROJECT_ID when client is injected."""
+        from agent_core.agents.base import Agent
+
+        with patch.dict(os.environ, {"GOOGLE_PROJECT_ID": ""}, clear=True):
+            agent = Agent(client=mock_client)
+            assert agent.client is mock_client
+            agent.close()
 
 
 class TestToolRegistration:
@@ -199,6 +215,78 @@ class TestToolRegistration:
         agent.close()
 
 
+class TestToolUnregistration:
+    """Test tool unregistration."""
+
+    def test_unregister_tool(self, mock_env, mock_genai):
+        """Should remove tool from all internal registries."""
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+
+        def my_tool(x: str) -> str:
+            """A tool."""
+            return x
+
+        agent.register_tool(my_tool)
+        assert "my_tool" in agent._tools
+
+        agent.unregister_tool("my_tool")
+        assert "my_tool" not in agent._tools
+        assert my_tool not in agent._tool_functions
+        agent.close()
+
+    def test_unregister_unknown_tool_raises(self, mock_env, mock_genai):
+        """Should raise KeyError for unknown tool name."""
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+        with pytest.raises(KeyError, match="no_such_tool"):
+            agent.unregister_tool("no_such_tool")
+        agent.close()
+
+    def test_unregister_then_register(self, mock_env, mock_genai):
+        """Should be able to register a new tool after unregistering one."""
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+
+        def tool_a(x: str) -> str:
+            """Tool A."""
+            return x
+
+        def tool_b(y: str) -> str:
+            """Tool B."""
+            return y
+
+        agent.register_tool(tool_a)
+        agent.unregister_tool("tool_a")
+        agent.register_tool(tool_b)
+
+        assert "tool_a" not in agent._tools
+        assert "tool_b" in agent._tools
+        assert len(agent._tool_functions) == 1
+        agent.close()
+
+    def test_unregister_last_tool(self, mock_env, mock_genai):
+        """Unregistering the only tool should leave empty declarations."""
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+
+        def only_tool(x: str) -> str:
+            """The only tool."""
+            return x
+
+        agent.register_tool(only_tool)
+        agent.unregister_tool("only_tool")
+
+        assert agent._tool_schemas is None
+        assert agent._tool_functions == []
+        assert agent._tools == {}
+        agent.close()
+
+
 class TestConversationHistory:
     """Test history management in run() and run_stateless()."""
 
@@ -260,6 +348,60 @@ class TestConversationHistory:
         assert len(saved) > 0
         agent.close()
 
+    def test_run_stateless_does_not_save_history(self, mock_env, mock_genai):
+        """run_stateless() should never call _save_history()."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+
+        # Multi-iteration: tool call followed by final text response
+        responses = [
+            make_tool_call_response("my_tool", {"x": "1"}),
+            make_text_response("done"),
+        ]
+        mock_client.models.generate_content.side_effect = responses
+
+        store = MagicMock()
+        agent = Agent(session_id="sess", conversation_store=store)
+
+        def my_tool(x: str) -> str:
+            """A tool."""
+            return "ok"
+
+        agent.register_tool(my_tool)
+        agent.run_stateless("go")
+
+        store.save.assert_not_called()
+        agent.close()
+
+    def test_run_saves_history_during_tool_loop(self, mock_env, mock_genai):
+        """run() should call _save_history() during the tool loop."""
+        from agent_core.agents.base import Agent
+        from agent_core.core.persistence import InMemoryConversationStore
+
+        mock_client = mock_genai.Client.return_value
+
+        responses = [
+            make_tool_call_response("my_tool", {"x": "1"}),
+            make_text_response("done"),
+        ]
+        mock_client.models.generate_content.side_effect = responses
+
+        store = InMemoryConversationStore()
+        agent = Agent(session_id="sess", conversation_store=store)
+
+        def my_tool(x: str) -> str:
+            """A tool."""
+            return "ok"
+
+        agent.register_tool(my_tool)
+        agent.run("go")
+
+        saved = store.load("sess", "base")
+        # user msg + model tool call + tool response + model final = 4
+        assert len(saved) == 4
+        agent.close()
+
 
 class TestLifecycleHooks:
     """Test that lifecycle hooks are called correctly."""
@@ -292,10 +434,11 @@ class TestLifecycleHooks:
         end_args = {}
 
         class HookedAgent(Agent):
-            def on_agent_end(self, result, success, error=None):
+            def on_agent_end(self, result, success, error=None, cancelled=False):
                 end_args["result"] = result
                 end_args["success"] = success
                 end_args["error"] = error
+                end_args["cancelled"] = cancelled
 
         agent = HookedAgent()
         agent.run("test")
@@ -303,6 +446,7 @@ class TestLifecycleHooks:
         assert end_args["success"] is True
         assert end_args["result"] == "ok"
         assert end_args["error"] is None
+        assert end_args["cancelled"] is False
         agent.close()
 
     def test_on_agent_end_called_on_failure(self, mock_env, mock_genai):
@@ -325,6 +469,36 @@ class TestLifecycleHooks:
 
         assert end_args["success"] is False
         assert "API down" in end_args["error"]
+        agent.close()
+
+    def test_on_agent_end_cancelled_flag(self, mock_env, mock_genai):
+        """on_agent_end should receive cancelled=True when cancelled."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_tool_call_response(
+            "my_tool", {}
+        )
+
+        end_args = {}
+
+        class HookedAgent(Agent):
+            def on_agent_end(self, result, success, error=None, cancelled=False):
+                end_args["success"] = success
+                end_args["cancelled"] = cancelled
+
+        agent = HookedAgent()
+
+        def my_tool() -> str:
+            """Tool that cancels."""
+            agent.cancel()
+            return "ok"
+
+        agent.register_tool(my_tool)
+        agent.run("go")
+
+        assert end_args["cancelled"] is True
+        assert end_args["success"] is False
         agent.close()
 
     def test_on_tool_hooks_called(self, mock_env, mock_genai):
@@ -393,6 +567,289 @@ class TestMaxIterations:
         agent.close()
 
 
+class TestCancellation:
+    """Test the cancellation mechanism."""
+
+    def test_cancel_stops_loop(self, mock_env, mock_genai):
+        """cancel() should cause the loop to return [Cancelled]."""
+        import threading
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+
+        # Always return tool calls — would loop forever without cancellation
+        mock_client.models.generate_content.return_value = make_tool_call_response(
+            "slow_tool", {}
+        )
+
+        agent = Agent()
+        agent.MAX_ITERATIONS = 100  # High limit to prove cancellation works
+
+        call_count = 0
+
+        def slow_tool() -> str:
+            """A slow tool."""
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                agent.cancel()
+            return "done"
+
+        agent.register_tool(slow_tool)
+        result = agent.run("go")
+
+        assert result == "[Cancelled]"
+        assert call_count < 100  # Did not hit MAX_ITERATIONS
+        agent.close()
+
+    def test_cancel_resets_on_new_run(self, mock_env, mock_genai):
+        """After a cancelled run, a new run() starts fresh."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+
+        call_count = 0
+
+        # First call: tool call that triggers cancel. Second call: normal text.
+        def side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return make_tool_call_response("my_tool", {})
+            return make_text_response("ok")
+
+        mock_client.models.generate_content.side_effect = side_effect
+
+        agent = Agent()
+
+        def my_tool() -> str:
+            """Tool that cancels."""
+            agent.cancel()
+            return "done"
+
+        agent.register_tool(my_tool)
+
+        # First run gets cancelled mid-loop
+        result1 = agent.run("first")
+        assert result1 == "[Cancelled]"
+
+        # Reset side_effect for clean second run
+        mock_client.models.generate_content.return_value = make_text_response("second ok")
+        mock_client.models.generate_content.side_effect = None
+
+        # Second run should complete normally (cancel cleared)
+        result2 = agent.run("second")
+        assert result2 == "second ok"
+        agent.close()
+
+    def test_cancel_from_another_thread(self, mock_env, mock_genai):
+        """cancel() called from another thread should stop the loop
+        even when a tool is still running."""
+        import threading
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+
+        # Model requests two parallel tools
+        mock_client.models.generate_content.return_value = make_multi_tool_call_response([
+            ("fast_tool", {}),
+            ("hung_tool", {}),
+        ])
+
+        agent = Agent()
+        agent.MAX_ITERATIONS = 100
+
+        fast_done = threading.Event()
+        hung_started = threading.Event()
+
+        def fast_tool() -> str:
+            """Completes immediately."""
+            fast_done.set()
+            return "fast result"
+
+        def hung_tool() -> str:
+            """Simulates a hung tool — waits until cancelled."""
+            hung_started.set()
+            # Block for a long time; cancel should break us out
+            self_cancel = agent._cancel_event
+            self_cancel.wait(timeout=10)
+            return "should not matter"
+
+        agent.register_tool(fast_tool)
+        agent.register_tool(hung_tool)
+
+        result_holder = {}
+
+        def run_agent():
+            result_holder["result"] = agent.run("go")
+
+        t = threading.Thread(target=run_agent)
+        t.start()
+
+        # Wait for both tools to be in flight, then cancel
+        fast_done.wait(timeout=5)
+        hung_started.wait(timeout=5)
+        agent.cancel()
+        t.join(timeout=10)
+
+        assert result_holder.get("result") == "[Cancelled]"
+        agent.close()
+
+    def test_shared_cancel_event_propagates(self, mock_env, mock_genai):
+        """Cancelling parent should stop a sub-agent sharing the same event."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_tool_call_response(
+            "sub_tool", {}
+        )
+
+        parent = Agent()
+        child = Agent(cancel_event=parent._cancel_event)
+
+        # They share the same event object
+        assert parent._cancel_event is child._cancel_event
+
+        child_calls = 0
+
+        def sub_tool() -> str:
+            """Child tool."""
+            nonlocal child_calls
+            child_calls += 1
+            if child_calls >= 2:
+                parent.cancel()  # Parent cancels — child should stop too
+            return "done"
+
+        child.register_tool(sub_tool)
+        result = child.run_stateless("go")
+
+        assert result == "[Cancelled]"
+        assert child_calls < 50
+        parent.close()
+        child.close()
+
+    def test_shared_event_not_cleared_by_sub_agent(self, mock_env, mock_genai):
+        """A sub-agent sharing a cancel event must not clear it on run()."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_text_response("ok")
+
+        parent = Agent()
+        child = Agent(cancel_event=parent._cancel_event)
+
+        # Parent cancels
+        parent.cancel()
+        assert parent._cancel_event.is_set()
+
+        # Child starts run_stateless — must NOT clear the shared event
+        result = child.run_stateless("go")
+        assert result == "[Cancelled]"
+
+        # Event should still be set (parent's cancel is respected)
+        assert parent._cancel_event.is_set()
+        parent.close()
+        child.close()
+
+    def test_own_event_cleared_on_new_run(self, mock_env, mock_genai):
+        """An agent with its own cancel event clears it on each run()."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+
+        call_count = 0
+
+        def side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return make_tool_call_response("t", {})
+            return make_text_response("done")
+
+        mock_client.models.generate_content.side_effect = side_effect
+
+        agent = Agent()
+
+        def t() -> str:
+            """Tool."""
+            agent.cancel()
+            return "ok"
+
+        agent.register_tool(t)
+
+        # First run: cancelled mid-loop
+        r1 = agent.run("go")
+        assert r1 == "[Cancelled]"
+
+        # Second run: event should be cleared, runs to completion
+        mock_client.models.generate_content.side_effect = None
+        mock_client.models.generate_content.return_value = make_text_response("second")
+        r2 = agent.run("again")
+        assert r2 == "second"
+        agent.close()
+
+    def test_cancel_single_tool_call(self, mock_env, mock_genai):
+        """Cancellation should work even with a single tool call."""
+        import threading
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_tool_call_response(
+            "slow_tool", {}
+        )
+
+        agent = Agent()
+        agent.MAX_ITERATIONS = 100
+        tool_started = threading.Event()
+
+        def slow_tool() -> str:
+            """A single slow tool."""
+            tool_started.set()
+            agent._cancel_event.wait(timeout=10)
+            return "done"
+
+        agent.register_tool(slow_tool)
+
+        result_holder = {}
+
+        def run_agent():
+            result_holder["result"] = agent.run("go")
+
+        t = threading.Thread(target=run_agent)
+        t.start()
+
+        tool_started.wait(timeout=5)
+        agent.cancel()
+        t.join(timeout=10)
+
+        assert result_holder.get("result") == "[Cancelled]"
+        agent.close()
+
+    def test_cancel_works_with_run_stateless(self, mock_env, mock_genai):
+        """cancel() should also work with run_stateless()."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+
+        # Always return tool calls
+        mock_client.models.generate_content.return_value = make_tool_call_response(
+            "my_tool", {}
+        )
+
+        agent = Agent()
+
+        def my_tool() -> str:
+            """Tool that triggers cancel."""
+            agent.cancel()
+            return "done"
+
+        agent.register_tool(my_tool)
+        result = agent.run_stateless("go")
+
+        assert result == "[Cancelled]"
+        agent.close()
+
+
 class TestAgentAsTool:
     """Test wrapping an agent as a tool for another agent."""
 
@@ -451,49 +908,117 @@ class TestGetContext:
         agent.close()
 
 
+class TestSummarizeResult:
+    """Test the _summarize_result method."""
+
+    def test_dict_with_error(self, mock_env, mock_genai):
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+        assert agent._summarize_result({"error": "boom"}) == "Error: boom"
+        agent.close()
+
+    def test_dict_with_text(self, mock_env, mock_genai):
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+        assert agent._summarize_result({"text": "hello"}) == "hello"
+        agent.close()
+
+    def test_dict_with_result_key(self, mock_env, mock_genai):
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+        assert agent._summarize_result({"result": "value"}) == "value"
+        agent.close()
+
+    def test_dict_fallback_shows_keys(self, mock_env, mock_genai):
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+        summary = agent._summarize_result({"a": 1, "b": 2})
+        assert "a" in summary and "b" in summary
+        agent.close()
+
+    def test_string_truncation(self, mock_env, mock_genai):
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+        long_str = "x" * 300
+        summary = agent._summarize_result(long_str)
+        assert len(summary) < 300
+        assert summary.endswith("...")
+        agent.close()
+
+    def test_list_result(self, mock_env, mock_genai):
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+        assert agent._summarize_result([1, 2, 3]) == "List[3 items]"
+        agent.close()
+
+    def test_none_result(self, mock_env, mock_genai):
+        from agent_core.agents.base import Agent
+
+        agent = Agent()
+        assert agent._summarize_result(None) == "None"
+        agent.close()
+
+    def test_overridable_in_subclass(self, mock_env, mock_genai):
+        """Subclass can override _summarize_result for domain-specific logic."""
+        from agent_core.agents.base import Agent
+
+        class CustomAgent(Agent):
+            def _summarize_result(self, result, max_length=200):
+                if isinstance(result, dict) and "custom_key" in result:
+                    return f"Custom: {result['custom_key']}"
+                return super()._summarize_result(result, max_length)
+
+        agent = CustomAgent()
+        assert agent._summarize_result({"custom_key": "val"}) == "Custom: val"
+        assert agent._summarize_result({"text": "hello"}) == "hello"
+        agent.close()
+
+
 class TestEventEmission:
     """Test that events are emitted at the right lifecycle points."""
 
-    def test_agent_start_event_emitted(self, mock_env, mock_genai, mock_events):
+    def test_agent_start_event_emitted(self, mock_env, mock_genai):
         """AGENT_START event should be emitted when run() is called."""
         from agent_core.agents.base import Agent
-        from agent_core.core.events import EventType
+        from agent_core.core.events import EventBus, EventType
 
         mock_client = mock_genai.Client.return_value
         mock_client.models.generate_content.return_value = make_text_response("ok")
 
-        agent = Agent()
+        bus = EventBus()
+        agent = Agent(event_bus=bus)
         agent.run("test")
 
-        # Find the AGENT_START call
-        start_calls = [
-            c for c in mock_events.call_args_list
-            if c.args and c.args[0] == EventType.AGENT_START
-        ]
-        assert len(start_calls) == 1
+        start_events = [e for e in bus.get_events() if e.type == EventType.AGENT_START]
+        assert len(start_events) == 1
         agent.close()
 
-    def test_agent_end_event_emitted(self, mock_env, mock_genai, mock_events):
+    def test_agent_end_event_emitted(self, mock_env, mock_genai):
         """AGENT_END event should be emitted when run() completes."""
         from agent_core.agents.base import Agent
-        from agent_core.core.events import EventType
+        from agent_core.core.events import EventBus, EventType
 
         mock_client = mock_genai.Client.return_value
         mock_client.models.generate_content.return_value = make_text_response("ok")
 
-        agent = Agent()
+        bus = EventBus()
+        agent = Agent(event_bus=bus)
         agent.run("test")
 
-        end_calls = [
-            c for c in mock_events.call_args_list
-            if c.args and c.args[0] == EventType.AGENT_END
-        ]
-        assert len(end_calls) == 1
+        end_events = [e for e in bus.get_events() if e.type == EventType.AGENT_END]
+        assert len(end_events) == 1
         agent.close()
 
-    def test_events_disabled(self, mock_env, mock_genai, mock_events):
+    def test_events_disabled(self, mock_env, mock_genai):
         """Events should not be emitted when disabled."""
         from agent_core.agents.base import Agent
+        from agent_core.core.events import EventBus
 
         class SilentAgent(Agent):
             emit_lifecycle_events = False
@@ -502,8 +1027,29 @@ class TestEventEmission:
         mock_client = mock_genai.Client.return_value
         mock_client.models.generate_content.return_value = make_text_response("ok")
 
-        agent = SilentAgent()
+        bus = EventBus()
+        agent = SilentAgent(event_bus=bus)
         agent.run("test")
 
-        mock_events.assert_not_called()
+        assert len(bus.get_events()) == 0
         agent.close()
+
+    def test_isolated_event_bus(self, mock_env, mock_genai):
+        """Agents with different event buses should not see each other's events."""
+        from agent_core.agents.base import Agent
+        from agent_core.core.events import EventBus
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_text_response("ok")
+
+        bus_a = EventBus()
+        bus_b = EventBus()
+        agent_a = Agent(event_bus=bus_a)
+        agent_b = Agent(event_bus=bus_b)
+
+        agent_a.run("hello")
+
+        assert len(bus_a.get_events()) > 0
+        assert len(bus_b.get_events()) == 0
+        agent_a.close()
+        agent_b.close()

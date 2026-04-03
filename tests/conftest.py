@@ -145,16 +145,20 @@ def make_multi_tool_call_response(calls: list[tuple[str, dict]]) -> MockResponse
 
 @pytest.fixture
 def mock_env():
-    """Set required environment variables and patch the module-level constant."""
-    with patch.dict(os.environ, {"GOOGLE_PROJECT_ID": "test-project"}), \
-         patch("agent_core.agents.base.GOOGLE_PROJECT_ID", "test-project"):
+    """Set required environment variables."""
+    with patch.dict(os.environ, {"GOOGLE_PROJECT_ID": "test-project"}):
         yield
 
 
 @pytest.fixture
 def mock_genai():
-    """Mock the google.genai module for agent_core."""
-    with patch("agent_core.agents.base.genai") as mock:
+    """Mock the google.genai module for agent_core (base + provider)."""
+    with (
+        patch("agent_core.agents.base.genai") as mock,
+        patch("agent_core.providers.gemini.genai", mock),
+        patch("agent_core.providers.gemini.types") as mock_types,
+        patch("agent_core.providers.gemini.ClientError", type("MockClientError", (Exception,), {"code": None})),
+    ):
         # Setup default client behavior
         mock_client = MagicMock()
         mock.Client.return_value = mock_client
@@ -166,13 +170,22 @@ def mock_genai():
         mock_client.caches.create.return_value = MockCachedContent()
         mock_client.caches.delete.return_value = None
 
+        # Wire up types to use our mock classes
+        mock_types.Content = MockContent
+        mock_types.Part = MockPart
+        mock_types.Tool = MagicMock
+        mock_types.FunctionDeclaration = MagicMock()
+        mock_types.FunctionDeclaration.from_callable.return_value = MagicMock()
+        mock_types.GenerateContentConfig = MagicMock
+        mock_types.AutomaticFunctionCallingConfig = MagicMock
+
         yield mock
 
 
 @pytest.fixture
 def mock_types():
-    """Mock the google.genai.types module for agent_core."""
-    with patch("agent_core.agents.base.types") as mock:
+    """Mock the google.genai.types module for agent_core (legacy fixture)."""
+    with patch("agent_core.providers.gemini.types") as mock:
         mock.Content = MockContent
         mock.Part = MockPart
         mock.GenerateContentConfig = MagicMock
@@ -197,6 +210,17 @@ def mock_cache_registry():
         mock_reg.get_advice.return_value = CacheAdvice(cache_name=None, contents_offset=0)
         mock_cls.return_value = mock_reg
         yield mock_reg
+
+
+@pytest.fixture
+def mock_client():
+    """Create a pre-configured mock Gemini client for injection tests."""
+    client = MagicMock()
+    client.models.count_tokens.return_value = MockTokenCountResponse(1000)
+    client.models.generate_content.return_value = make_text_response("ok")
+    client.caches.create.return_value = MockCachedContent()
+    client.caches.delete.return_value = None
+    return client
 
 
 @pytest.fixture

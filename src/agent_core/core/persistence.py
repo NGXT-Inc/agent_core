@@ -7,15 +7,22 @@ This module provides:
 
 Applications can implement their own stores (Redis, PostgreSQL, etc.)
 by following the ConversationStoreProtocol.
+
+The Gemini-specific ``serialize_content`` / ``deserialize_content`` functions
+are kept for backward compatibility (used by Papyrus chat_persistence.py).
+For provider-agnostic serialization, use ``serialize_message`` / ``deserialize_message``.
 """
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from google.genai import types
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -24,9 +31,11 @@ class ConversationStoreProtocol(Protocol):
 
     Implement this interface to provide custom persistence
     (e.g., Redis, PostgreSQL, file-based, cloud storage).
+
+    Messages are provider-specific opaque objects (``Any``).
     """
 
-    def load(self, session_id: str, agent_type: str) -> list[types.Content]:
+    def load(self, session_id: str, agent_type: str) -> list[Any]:
         """Load conversation history for a session/agent pair.
 
         Args:
@@ -34,17 +43,17 @@ class ConversationStoreProtocol(Protocol):
             agent_type: Type of agent (e.g., "designer", "researcher").
 
         Returns:
-            List of Gemini Content objects representing the conversation.
+            List of provider-specific message objects.
         """
         ...
 
-    def save(self, session_id: str, agent_type: str, history: list[types.Content]) -> None:
+    def save(self, session_id: str, agent_type: str, history: list[Any]) -> None:
         """Save conversation history for a session/agent pair.
 
         Args:
             session_id: Unique session identifier.
             agent_type: Type of agent.
-            history: List of Gemini Content objects to persist.
+            history: List of provider-specific message objects.
         """
         ...
 
@@ -70,13 +79,13 @@ class InMemoryConversationStore:
     """
 
     def __init__(self):
-        self._store: dict[tuple[str, str], list[types.Content]] = {}
+        self._store: dict[tuple[str, str], list[Any]] = {}
 
-    def load(self, session_id: str, agent_type: str) -> list[types.Content]:
+    def load(self, session_id: str, agent_type: str) -> list[Any]:
         key = (session_id, agent_type)
         return self._store.get(key, []).copy()
 
-    def save(self, session_id: str, agent_type: str, history: list[types.Content]) -> None:
+    def save(self, session_id: str, agent_type: str, history: list[Any]) -> None:
         key = (session_id, agent_type)
         self._store[key] = history.copy()
 
@@ -155,7 +164,18 @@ def deserialize_content(data: dict[str, Any]) -> types.Content:
                 response=part_data.get("response", {}),
             ))
 
-        # Skip inline_data and thought parts during restoration
+        elif part_type == "thought":
+            # Restore thought as text (Gemini SDK doesn't have Part.from_thought)
+            thought_text = part_data.get("thought", "")
+            if thought_text:
+                parts.append(types.Part.from_text(text=thought_text))
+
+        elif part_type == "inline_data":
+            # Binary data was intentionally skipped during serialization
+            pass
+
+        else:
+            logger.warning("Unknown part type during deserialization: %s", part_type)
 
     return types.Content(role=data.get("role", "user"), parts=parts)
 
@@ -172,6 +192,28 @@ def deserialize_history(json_str: str) -> list[types.Content]:
     return [deserialize_content(d) for d in data]
 
 
+def serialize_message(message: Any, provider: Any = None) -> dict[str, Any]:
+    """Serialize a provider message to a JSON-safe dict.
+
+    If *provider* is given, delegates to ``provider.serialize_message()``.
+    Otherwise falls back to Gemini-specific ``serialize_content()``.
+    """
+    if provider is not None:
+        return provider.serialize_message(message)
+    return serialize_content(message)
+
+
+def deserialize_message(data: dict[str, Any], provider: Any = None) -> Any:
+    """Deserialize a JSON dict to a provider message.
+
+    If *provider* is given, delegates to ``provider.deserialize_message()``.
+    Otherwise falls back to Gemini-specific ``deserialize_content()``.
+    """
+    if provider is not None:
+        return provider.deserialize_message(data)
+    return deserialize_content(data)
+
+
 class SQLiteConversationStore:
     """SQLite-based conversation persistence.
 
@@ -180,10 +222,13 @@ class SQLiteConversationStore:
 
     Args:
         db_path: Path to SQLite database file. Created if doesn't exist.
+        provider: Optional LLMProvider for serialization. If ``None``,
+            uses Gemini-specific serialization (backward compat).
     """
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, provider: Any = None):
         self.db_path = Path(db_path)
+        self._provider = provider
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -211,7 +256,7 @@ class SQLiteConversationStore:
         finally:
             conn.close()
 
-    def load(self, session_id: str, agent_type: str) -> list[types.Content]:
+    def load(self, session_id: str, agent_type: str) -> list[Any]:
         with self._connection() as conn:
             cursor = conn.execute(
                 "SELECT history FROM conversations WHERE session_id = ? AND agent_type = ?",
@@ -220,11 +265,13 @@ class SQLiteConversationStore:
             row = cursor.fetchone()
 
         if row and row["history"]:
-            return deserialize_history(row["history"])
+            data = json.loads(row["history"])
+            return [deserialize_message(d, self._provider) for d in data]
         return []
 
-    def save(self, session_id: str, agent_type: str, history: list[types.Content]) -> None:
-        history_json = serialize_history(history)
+    def save(self, session_id: str, agent_type: str, history: list[Any]) -> None:
+        serialized = [serialize_message(m, self._provider) for m in history]
+        history_json = json.dumps(serialized)
         with self._connection() as conn:
             conn.execute(
                 """

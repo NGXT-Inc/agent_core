@@ -9,6 +9,7 @@ events (experiments, notebooks, etc.) should be defined in the application.
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
@@ -91,14 +92,19 @@ class EventBus:
     """Simple event bus for publishing and subscribing to events.
 
     Provides robust error handling and delivery tracking for event broadcasting.
+
+    Args:
+        max_events: Maximum number of events to retain. Oldest events are
+            discarded when the limit is reached. Defaults to 10_000.
+            Set to 0 for unlimited (not recommended for long-running apps).
     """
 
-    def __init__(self):
-        self._events: list[Event] = []
+    def __init__(self, max_events: int = 10_000):
+        self._events: deque[Event] = deque(maxlen=max_events or None)
+        self._max_events = max_events
         self._subscribers: list[Callable[[Event], None]] = []
         # Track delivery failures for debugging
-        self._failed_deliveries: list[dict] = []
-        self._max_failed_deliveries: int = 100
+        self._failed_deliveries: deque[dict] = deque(maxlen=100)
 
     def emit(self, event: Event) -> None:
         """Emit an event to all subscribers.
@@ -108,26 +114,17 @@ class EventBus:
         """
         self._events.append(event)
 
-        delivery_errors = []
         for subscriber in self._subscribers:
             try:
                 subscriber(event)
             except Exception as e:
-                error_info = {
+                self._failed_deliveries.append({
                     "event_type": event.type.value if isinstance(event.type, Enum) else event.type,
                     "agent": event.agent,
                     "error": str(e),
                     "timestamp": event.timestamp,
-                }
-                delivery_errors.append(error_info)
+                })
                 logger.warning(f"Subscriber error for {event.type}: {e}")
-
-        # Track failed deliveries (with rolling window)
-        if delivery_errors:
-            self._failed_deliveries.extend(delivery_errors)
-            # Keep only the most recent failures
-            if len(self._failed_deliveries) > self._max_failed_deliveries:
-                self._failed_deliveries = self._failed_deliveries[-self._max_failed_deliveries :]
 
     def subscribe(self, callback: Callable[[Event], None]) -> None:
         """Subscribe to events."""
@@ -140,7 +137,7 @@ class EventBus:
 
     def get_events(self) -> list[Event]:
         """Get all events."""
-        return self._events.copy()
+        return list(self._events)
 
     def clear(self) -> None:
         """Clear all events."""
@@ -149,18 +146,19 @@ class EventBus:
     def get_recent(self, since_timestamp: float | None = None) -> list[Event]:
         """Get events since a timestamp."""
         if since_timestamp is None:
-            return self._events.copy()
+            return list(self._events)
         return [e for e in self._events if e.timestamp > since_timestamp]
 
     def get_failed_deliveries(self) -> list[dict]:
         """Get recent failed event deliveries for debugging."""
-        return self._failed_deliveries.copy()
+        return list(self._failed_deliveries)
 
     def get_health_status(self) -> dict:
         """Get health status of the event bus."""
         return {
             "subscriber_count": len(self._subscribers),
             "total_events": len(self._events),
+            "max_events": self._max_events,
             "recent_failures": len(self._failed_deliveries),
             "is_healthy": len(self._failed_deliveries) < 10,
         }
