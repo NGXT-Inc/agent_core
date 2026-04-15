@@ -184,11 +184,23 @@ class GeminiProvider:
             file_attachments: list[dict] = []
 
             if isinstance(result, dict):
-                file_attachments = (
-                    (result.get("files") or []) + (result.get("images") or [])
-                )
+                # Only extract file attachments when the value is a list
+                # of attachment dicts. Tools like read_github_files return
+                # {"files": {path: content}} which is NOT an attachment list.
+                raw_files = result.get("files")
+                raw_images = result.get("images")
+                files_list = raw_files if isinstance(raw_files, list) else []
+                images_list = raw_images if isinstance(raw_images, list) else []
+                file_attachments = files_list + images_list
+
+                # Strip attachment keys only when they were actual attachments
+                exclude = set()
+                if isinstance(raw_files, list):
+                    exclude.add("files")
+                if isinstance(raw_images, list):
+                    exclude.add("images")
                 response_data = {
-                    k: v for k, v in result.items() if k not in ("files", "images")
+                    k: v for k, v in result.items() if k not in exclude
                 }
             else:
                 response_data = {"result": str(result)}
