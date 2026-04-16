@@ -1,6 +1,7 @@
 """Agent Core - Extensible agent orchestration framework with multi-LLM support."""
 
 from agent_core.agents.base import Agent, agent_as_tool, generate_instance_id
+from agent_core.agents.compaction import CompactionConfig
 from agent_core.core.events import (
     EventType,
     EventStatus,
@@ -20,6 +21,7 @@ from agent_core.providers.gemini import GeminiProvider
 __all__ = [
     # Agent
     "Agent",
+    "CompactionConfig",
     "agent_as_tool",
     "generate_instance_id",
     # Providers

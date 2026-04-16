@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 from dotenv import find_dotenv, load_dotenv
 from google import genai
 
+from agent_core.agents.compaction import (
+    CompactionConfig,
+    approximate_tokens,
+    estimate_history_tokens,
+    render_message_for_compaction,
+    select_preserved_tail_start,
+    trimmed_transcript_lines,
+)
 from agent_core.core.caching import ContextCacheRegistry
 from agent_core.core.events import EventBus, EventType, EventStatus, Event, get_event_bus, emit_event
 from agent_core.core.persistence import ConversationStoreProtocol, InMemoryConversationStore
@@ -168,6 +176,9 @@ class Agent:
     ENABLE_CACHING: ClassVar[bool] = True
     CACHE_MIN_TOKENS: ClassVar[int] = 32_768
 
+    # Context compaction
+    ENABLE_COMPACTION: ClassVar[bool] = False
+
     # Shared cache registry (initialized once at app startup)
     _cache_registry: ClassVar[ContextCacheRegistry | None] = None
 
@@ -285,6 +296,7 @@ class Agent:
             )
         else:
             self._history: list[Any] = []
+        self._compaction_count = 0
 
         # Parent agent instance ID for event tracking (graph edges)
         self._parent_agent: str | None = parent_agent
@@ -388,6 +400,121 @@ class Agent:
         Args:
             text: The intermediate text from the model.
         """
+        pass
+
+    def get_compaction_config(self) -> CompactionConfig:
+        """Return the context compaction policy for this agent.
+
+        Override in subclasses to enable or tune compaction.
+        """
+        return CompactionConfig(enabled=self.ENABLE_COMPACTION)
+
+    def build_compaction_summary_prompt(
+        self,
+        older_messages: list[Any],
+        preserved_messages: list[Any],
+        *,
+        config: CompactionConfig,
+    ) -> tuple[str | None, str]:
+        """Build the summarizer prompt for history compaction."""
+        transcript_lines = self._transcript_lines_for_compaction(
+            older_messages, config.max_message_chars
+        )
+        transcript_lines = trimmed_transcript_lines(
+            transcript_lines, max_chars=config.max_transcript_chars
+        )
+        transcript = "\n\n".join(transcript_lines)
+        if not transcript.strip():
+            transcript = self._fallback_compaction_summary(transcript_lines)
+
+        system_prompt = (
+            "You compact agent conversation history so the same agent can keep "
+            "working after earlier context is removed. Return plain text only."
+        )
+        prompt = (
+            f"Summarize the earlier conversation history for the `{self.name}` agent.\n"
+            "Focus on durable context that the next model call still needs:\n"
+            "- the user's active goal, constraints, and preferences\n"
+            "- important files, URLs, entities, and IDs already found\n"
+            "- tool results, decisions, and partial work that should not be repeated\n"
+            "- unresolved questions and the most likely next step\n"
+            "- anything in the preserved recent messages that depends on older context\n\n"
+            "Be concise but information-dense. Do not add preamble, meta commentary, or bullet"
+            " numbering unless it helps clarity.\n\n"
+            f"Older messages being summarized: {len(older_messages)}\n"
+            f"Recent messages preserved verbatim after this summary: {len(preserved_messages)}\n\n"
+            "Older transcript:\n"
+            f"{transcript}"
+        )
+        return system_prompt, prompt
+
+    def build_compacted_summary_message(
+        self,
+        summary: str,
+        *,
+        preserved_messages: int,
+    ) -> Any:
+        """Build the synthetic history item that replaces old context."""
+        preserved_note = (
+            "Recent raw messages continue after this summary and remain authoritative."
+            if preserved_messages
+            else "No raw messages were preserved after this summary."
+        )
+        text = (
+            f"Internal context compaction summary for the ongoing `{self.name}` agent.\n\n"
+            "This summary replaces earlier conversation history so the agent can continue "
+            "the same task without losing important context.\n"
+            f"{preserved_note}\n\n"
+            f"{summary.strip()}"
+        )
+        return self._provider.build_user_message(text)
+
+    def on_compaction_start(
+        self,
+        *,
+        compaction_id: str,
+        scope: str,
+        pre_tokens: int,
+        config: CompactionConfig,
+        history_items_before: int,
+    ) -> None:
+        """Called before history compaction starts."""
+        pass
+
+    def on_compaction_complete(
+        self,
+        *,
+        compaction_id: str,
+        scope: str,
+        pre_tokens: int,
+        post_tokens: int,
+        config: CompactionConfig,
+        history_items_before: int,
+        history_items_after: int,
+        older_messages: int,
+        preserved_messages: int,
+        summary: str,
+        duration_ms: int,
+        contents: list[Any],
+        save_history: bool,
+    ) -> None:
+        """Called after history compaction succeeds."""
+        pass
+
+    def on_compaction_failed(
+        self,
+        *,
+        compaction_id: str,
+        scope: str,
+        pre_tokens: int,
+        config: CompactionConfig,
+        history_items_before: int,
+        error: Exception,
+        duration_ms: int,
+        contents: list[Any],
+        save_history: bool,
+    ) -> None:
+        """Called when history compaction fails."""
         pass
 
     # --- Provider Access ---
@@ -749,6 +876,175 @@ class Agent:
         except Exception:
             return 0
 
+    def _count_context_tokens_for_compaction(
+        self, contents: list[Any], max_chars: int
+    ) -> int:
+        """Count tokens for an arbitrary message list, with a display fallback."""
+        try:
+            token_count = self._provider.count_tokens(
+                self.model_name, contents, self.system_prompt
+            )
+        except Exception:
+            token_count = 0
+        if token_count:
+            return token_count
+        return estimate_history_tokens(
+            self._provider, contents, max_chars=max_chars
+        ) + approximate_tokens(self.system_prompt or "")
+
+    def _transcript_lines_for_compaction(
+        self, messages: list[Any], max_chars: int
+    ) -> list[str]:
+        lines = []
+        for message in messages:
+            line = render_message_for_compaction(
+                self._provider, message, max_chars=max_chars
+            )
+            if line:
+                lines.append(line)
+        return lines
+
+    def _fallback_compaction_summary(self, transcript_lines: list[str]) -> str:
+        if not transcript_lines:
+            return "No earlier transcript content was available to summarize."
+        tail = transcript_lines[-6:]
+        return "Fallback compacted context:\n" + "\n\n".join(tail)
+
+    def _generate_compaction_summary(
+        self,
+        older_messages: list[Any],
+        preserved_messages: list[Any],
+        *,
+        config: CompactionConfig,
+    ) -> tuple[str, TokenUsage]:
+        system_prompt, prompt = self.build_compaction_summary_prompt(
+            older_messages,
+            preserved_messages,
+            config=config,
+        )
+        raw_response = self._generate_with_retry(
+            model=self.model_name,
+            messages=[self._provider.build_user_message(prompt)],
+            system_prompt=system_prompt,
+            temperature=0.2,
+            max_output_tokens=config.summary_max_output_tokens,
+            tool_schemas=None,
+            cache_config=None,
+        )
+        if raw_response is None:
+            raise RuntimeError("Compaction cancelled during summary generation")
+
+        parsed = self._provider.parse_response(raw_response)
+        summary = (parsed.text or "").strip()
+        if not summary:
+            transcript_lines = self._transcript_lines_for_compaction(
+                older_messages, config.max_message_chars
+            )
+            summary = self._fallback_compaction_summary(transcript_lines)
+        return summary, parsed.usage
+
+    def _compaction_scope(self, contents: list[Any], save_history: bool) -> str:
+        return "session" if save_history and contents is self._history else "run"
+
+    def _maybe_compact_history(
+        self,
+        contents: list[Any],
+        *,
+        save_history: bool,
+    ) -> tuple[bool, TokenUsage]:
+        config = self.get_compaction_config()
+        if not config.enabled or self._compaction_count >= config.max_compactions_per_run:
+            return False, TokenUsage()
+        if len(contents) < max(2, config.min_preserved_messages + 1):
+            return False, TokenUsage()
+
+        pre_tokens = self._count_context_tokens_for_compaction(
+            contents, config.max_message_chars
+        )
+        if not pre_tokens or pre_tokens < config.trigger_tokens:
+            return False, TokenUsage()
+
+        preserved_start = select_preserved_tail_start(
+            self._provider,
+            contents,
+            tail_token_budget=config.tail_token_budget,
+            min_messages=config.min_preserved_messages,
+            max_chars=config.max_message_chars,
+        )
+        if preserved_start <= 0:
+            return False, TokenUsage()
+
+        older_messages = contents[:preserved_start]
+        preserved_messages = contents[preserved_start:]
+        if not older_messages or not preserved_messages:
+            return False, TokenUsage()
+
+        scope = self._compaction_scope(contents, save_history)
+        compaction_id = f"compaction_{uuid.uuid4().hex[:8]}"
+        started_at = time.time()
+        history_items_before = len(contents)
+        self._compaction_count += 1
+        self.on_compaction_start(
+            compaction_id=compaction_id,
+            scope=scope,
+            pre_tokens=pre_tokens,
+            config=config,
+            history_items_before=history_items_before,
+        )
+
+        try:
+            summary, usage = self._generate_compaction_summary(
+                older_messages,
+                preserved_messages,
+                config=config,
+            )
+            compacted_message = self.build_compacted_summary_message(
+                summary,
+                preserved_messages=len(preserved_messages),
+            )
+            contents[:] = [compacted_message, *preserved_messages]
+            if save_history:
+                self._save_history()
+            self._invalidate_cache()
+
+            post_tokens = self._count_context_tokens_for_compaction(
+                contents, config.max_message_chars
+            )
+            self.on_compaction_complete(
+                compaction_id=compaction_id,
+                scope=scope,
+                pre_tokens=pre_tokens,
+                post_tokens=post_tokens,
+                config=config,
+                history_items_before=history_items_before,
+                history_items_after=len(contents),
+                older_messages=len(older_messages),
+                preserved_messages=len(preserved_messages),
+                summary=summary,
+                duration_ms=int((time.time() - started_at) * 1000),
+                contents=contents,
+                save_history=save_history,
+            )
+            return True, usage
+        except Exception as exc:
+            logger.warning(
+                "Compaction failed for agent %s: %s",
+                self.name,
+                exc,
+            )
+            self.on_compaction_failed(
+                compaction_id=compaction_id,
+                scope=scope,
+                pre_tokens=pre_tokens,
+                config=config,
+                history_items_before=history_items_before,
+                error=exc,
+                duration_ms=int((time.time() - started_at) * 1000),
+                contents=contents,
+                save_history=save_history,
+            )
+            return False, TokenUsage()
+
     # --- Tool Execution ---
 
     def _execute_tool(self, tool_call: ToolCall) -> tuple[str, Any]:
@@ -888,15 +1184,52 @@ class Agent:
             if self._cancel_event.is_set():
                 return "[Cancelled]", _usage_dict()
 
-            raw_response = self._generate_with_retry(
-                model=self.model_name,
-                messages=contents,
-                system_prompt=self.system_prompt,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-                tool_schemas=self._tool_schemas,
-                cache_config=cache_config,
-            )
+            while True:
+                compacted, compaction_usage = self._maybe_compact_history(
+                    contents,
+                    save_history=save_history,
+                )
+                total.prompt_tokens += compaction_usage.prompt_tokens
+                total.completion_tokens += compaction_usage.completion_tokens
+                total.cached_tokens += compaction_usage.cached_tokens
+                if not compacted:
+                    break
+                cache_config = None
+                if self._cancel_event.is_set():
+                    return "[Cancelled]", _usage_dict()
+
+            try:
+                raw_response = self._generate_with_retry(
+                    model=self.model_name,
+                    messages=contents,
+                    system_prompt=self.system_prompt,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    tool_schemas=self._tool_schemas,
+                    cache_config=cache_config,
+                )
+            except Exception as exc:
+                overflow_markers = (
+                    "context",
+                    "prompt",
+                    "token",
+                    "too large",
+                    "too long",
+                )
+                message = str(exc).lower()
+                if any(marker in message for marker in overflow_markers):
+                    compacted, compaction_usage = self._maybe_compact_history(
+                        contents,
+                        save_history=save_history,
+                    )
+                    total.prompt_tokens += compaction_usage.prompt_tokens
+                    total.completion_tokens += compaction_usage.completion_tokens
+                    total.cached_tokens += compaction_usage.cached_tokens
+                    if compacted:
+                        cache_config = None
+                        iteration -= 1
+                        continue
+                raise
 
             # None means cancelled during retry backoff
             if raw_response is None:
@@ -1043,6 +1376,7 @@ class Agent:
         if self._owns_cancel_event:
             self._cancel_event.clear()
 
+        self._compaction_count = 0
         self.on_agent_start(prompt)
 
         if self.emit_lifecycle_events:

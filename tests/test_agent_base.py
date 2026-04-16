@@ -10,6 +10,7 @@ from tests.conftest import (
     MockPart,
     MockFunctionCall,
     MockResponse,
+    MockTokenCountResponse,
     MockUsageMetadata,
     make_text_response,
     make_tool_call_response,
@@ -1053,3 +1054,129 @@ class TestEventEmission:
         assert len(bus_b.get_events()) == 0
         agent_a.close()
         agent_b.close()
+
+
+class TestCompaction:
+    """Test automatic context compaction in the shared runtime."""
+
+    def test_run_compacts_history_before_model_call(self, mock_env, mock_genai):
+        """run() should compact old history when the context threshold is exceeded."""
+        from agent_core.agents.base import Agent
+        from agent_core.agents.compaction import CompactionConfig
+
+        mock_client = mock_genai.Client.return_value
+
+        token_counts = iter([MockTokenCountResponse(80), MockTokenCountResponse(20), MockTokenCountResponse(20)])
+        mock_client.models.count_tokens.side_effect = lambda *args, **kwargs: next(token_counts)
+        mock_client.models.generate_content.side_effect = [
+            make_text_response("Compacted summary"),
+            make_text_response("done"),
+        ]
+
+        hook_calls = []
+
+        class CompactingAgent(Agent):
+            ENABLE_COMPACTION = True
+
+            def get_compaction_config(self):
+                return CompactionConfig(
+                    enabled=True,
+                    model_limit_tokens=100,
+                    trigger_tokens=50,
+                    target_tokens=30,
+                    tail_token_budget=1,
+                    response_buffer_tokens=20,
+                    summary_max_output_tokens=128,
+                    max_transcript_chars=4000,
+                    max_message_chars=1000,
+                    min_preserved_messages=1,
+                    max_compactions_per_run=2,
+                )
+
+            def on_compaction_start(self, **kwargs):
+                hook_calls.append(("start", kwargs["scope"], kwargs["pre_tokens"]))
+
+            def on_compaction_complete(self, **kwargs):
+                hook_calls.append(
+                    ("complete", kwargs["scope"], kwargs["pre_tokens"], kwargs["post_tokens"])
+                )
+
+        agent = CompactingAgent()
+        agent._history.append(agent._provider.build_user_message("Earlier context"))
+
+        result = agent.run("Latest request")
+
+        assert result == "done"
+        assert hook_calls == [
+            ("start", "session", 80),
+            ("complete", "session", 80, 20),
+        ]
+        assert mock_client.models.generate_content.call_count == 2
+        summary_display = agent._provider.format_message_for_display(agent._history[0])
+        assert summary_display is not None
+        assert "Internal context compaction summary" in summary_display["content"]
+        agent.close()
+
+    def test_run_stateless_can_compact_mid_run(self, mock_env, mock_genai):
+        """run_stateless() should compact accumulated context for sub-agent style runs."""
+        from agent_core.agents.base import Agent
+        from agent_core.agents.compaction import CompactionConfig
+
+        mock_client = mock_genai.Client.return_value
+
+        token_counts = iter([
+            MockTokenCountResponse(90),
+            MockTokenCountResponse(25),
+            MockTokenCountResponse(25),
+        ])
+        mock_client.models.count_tokens.side_effect = lambda *args, **kwargs: next(token_counts)
+        mock_client.models.generate_content.side_effect = [
+            make_tool_call_response("my_tool", {}),
+            make_text_response("Stateless compacted summary"),
+            make_text_response("done"),
+        ]
+
+        hook_calls = []
+
+        class CompactingAgent(Agent):
+            ENABLE_COMPACTION = True
+
+            def get_compaction_config(self):
+                return CompactionConfig(
+                    enabled=True,
+                    model_limit_tokens=100,
+                    trigger_tokens=50,
+                    target_tokens=30,
+                    tail_token_budget=1,
+                    response_buffer_tokens=20,
+                    summary_max_output_tokens=128,
+                    max_transcript_chars=4000,
+                    max_message_chars=1000,
+                    min_preserved_messages=1,
+                    max_compactions_per_run=2,
+                )
+
+            def on_compaction_start(self, **kwargs):
+                hook_calls.append(("start", kwargs["scope"], kwargs["pre_tokens"]))
+
+            def on_compaction_complete(self, **kwargs):
+                hook_calls.append(
+                    ("complete", kwargs["scope"], kwargs["pre_tokens"], kwargs["post_tokens"])
+                )
+
+        agent = CompactingAgent()
+
+        def my_tool() -> str:
+            """Simple tool used to grow stateless history."""
+            return "tool output"
+
+        agent.register_tool(my_tool)
+        result = agent.run_stateless("Need tool work first")
+
+        assert result == "done"
+        assert hook_calls == [
+            ("start", "run", 90),
+            ("complete", "run", 90, 25),
+        ]
+        assert mock_client.models.generate_content.call_count == 3
+        agent.close()
