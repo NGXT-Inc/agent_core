@@ -50,6 +50,7 @@ class ParsedResponse:
     raw_message: Any
     usage: TokenUsage = field(default_factory=TokenUsage)
     thinking_text: str | None = None
+    streamed_text: bool = False
 
 
 @runtime_checkable
@@ -90,6 +91,27 @@ class LLMProvider(Protocol):
             cache_config: Optional provider-specific caching hints.
                 Gemini uses ``{"cache_name": str, "contents_offset": int}``.
                 Providers that don't support caching ignore this.
+        """
+        ...
+
+    def generate_stream(
+        self,
+        model: str,
+        messages: list[Any],
+        system_prompt: str | None,
+        temperature: float,
+        max_output_tokens: int,
+        tool_schemas: Any | None = None,
+        *,
+        cache_config: dict | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> Any:
+        """Stream a model response and return the final aggregated response.
+
+        Implementations should call *on_text_delta* for text chunks as they
+        arrive, but still return a complete provider-specific response that
+        ``parse_response()`` can consume normally. Providers that cannot stream
+        may delegate to ``generate()`` and optionally emit the final text once.
         """
         ...
 

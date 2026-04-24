@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent_core.providers.types import LLMProvider, ParsedResponse, TokenUsage, ToolCall
+from tests.conftest import make_text_response
 
 
 # ============================================================
@@ -422,6 +423,32 @@ class TestGeminiProvider:
                 provider = GeminiProvider(client=mock_client)
                 provider.build_user_message("hello")
                 mock_types.Content.assert_called_once()
+
+    def test_generate_stream_aggregates_text_chunks(self, mock_genai):
+        from agent_core.providers.gemini import GeminiProvider
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content_stream.return_value = iter([
+            make_text_response("stream"),
+            make_text_response("ed"),
+        ])
+        provider = GeminiProvider(client=mock_client)
+
+        deltas = []
+        response = provider.generate_stream(
+            model="gemini-test",
+            messages=[],
+            system_prompt="system",
+            temperature=0.7,
+            max_output_tokens=100,
+            tool_schemas=None,
+            on_text_delta=deltas.append,
+        )
+        parsed = provider.parse_response(response)
+
+        assert deltas == ["stream", "ed"]
+        assert parsed.text == "streamed"
+        assert parsed.streamed_text is True
 
 
 # ============================================================

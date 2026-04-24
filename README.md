@@ -63,6 +63,23 @@ agent = ResearcherAgent()
 response = agent.run("Find papers about transformer architectures")
 ```
 
+### Streaming Text
+
+User-facing callers can opt in to incremental text deltas while preserving the
+normal final return value and conversation history:
+
+```python
+response = agent.run(
+    "Explain recent work on retrieval-augmented generation",
+    streaming=True,
+    on_text_delta=lambda delta: print(delta, end="", flush=True),
+)
+```
+
+Streaming is transport-agnostic: applications decide whether deltas go to SSE,
+websockets, a terminal, or nowhere. The final response is still returned from
+`run()` and persisted through the configured conversation store.
+
 ## Configuration
 
 ### Class Attributes

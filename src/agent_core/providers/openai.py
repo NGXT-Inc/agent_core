@@ -26,11 +26,27 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from agent_core.providers.types import ParsedResponse, TokenUsage, ToolCall
 
 logger = logging.getLogger(__name__)
+
+
+class _StreamedOpenAIResponse:
+    """Minimal chat-completion response consumed by ``parse_response``."""
+
+    def __init__(
+        self,
+        *,
+        message: Any,
+        usage: Any | None,
+        streamed_text: bool,
+    ) -> None:
+        self.choices = [SimpleNamespace(message=message)]
+        self.usage = usage
+        self._agent_core_streamed_text = streamed_text
 
 
 class OpenAIProvider:
@@ -96,6 +112,102 @@ class OpenAIProvider:
 
         return self._client.chat.completions.create(**kwargs)
 
+    def generate_stream(
+        self,
+        model: str,
+        messages: list[Any],
+        system_prompt: str | None,
+        temperature: float,
+        max_output_tokens: int,
+        tool_schemas: Any | None = None,
+        *,
+        cache_config: dict | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> Any:
+        full_messages: list[dict] = []
+        if system_prompt:
+            full_messages.append({"role": "system", "content": system_prompt})
+        full_messages.extend(messages)
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": full_messages,
+            "temperature": temperature,
+            "max_tokens": max_output_tokens,
+            "stream": True,
+        }
+        if tool_schemas:
+            kwargs["tools"] = tool_schemas
+        if self._extra_body:
+            kwargs["extra_body"] = self._extra_body
+
+        text_chunks: list[str] = []
+        usage = None
+        role = "assistant"
+        streamed_text = False
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
+
+        for chunk in self._client.chat.completions.create(**kwargs):
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage
+
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+
+            role = getattr(delta, "role", None) or role
+            content = getattr(delta, "content", None)
+            if content:
+                text_chunks.append(content)
+                if on_text_delta:
+                    on_text_delta(content)
+                    streamed_text = True
+
+            for tc in getattr(delta, "tool_calls", None) or []:
+                index = getattr(tc, "index", 0) or 0
+                slot = tool_calls_by_index.setdefault(
+                    index,
+                    {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if getattr(tc, "id", None):
+                    slot["id"] = tc.id
+                if getattr(tc, "type", None):
+                    slot["type"] = tc.type
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["function"]["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["function"]["arguments"] += fn.arguments
+
+        tool_calls = [
+            SimpleNamespace(
+                id=(data.get("id") or f"call_{idx}"),
+                type=data.get("type") or "function",
+                function=SimpleNamespace(**data["function"]),
+            )
+            for idx, data in sorted(tool_calls_by_index.items())
+        ]
+        message = SimpleNamespace(
+            role=role,
+            content="".join(text_chunks) or None,
+            tool_calls=tool_calls or None,
+            reasoning_details=None,
+            reasoning=None,
+        )
+        return _StreamedOpenAIResponse(
+            message=message,
+            usage=usage,
+            streamed_text=streamed_text,
+        )
+
     def parse_response(self, response: Any) -> ParsedResponse:
         choice = response.choices[0]
         message = choice.message
@@ -141,6 +253,7 @@ class OpenAIProvider:
             raw_message=raw_msg,
             usage=usage,
             thinking_text=thinking_text,
+            streamed_text=bool(getattr(response, "_agent_core_streamed_text", False)),
         )
 
     # ------------------------------------------------------------------

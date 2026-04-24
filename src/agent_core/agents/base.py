@@ -1113,15 +1113,30 @@ class Agent:
     RETRY_BASE_DELAY: ClassVar[float] = 2.0   # seconds
     RETRY_MAX_DELAY: ClassVar[float] = 60.0    # seconds
 
-    def _generate_with_retry(self, **kwargs):
+    def _generate_with_retry(
+        self,
+        *,
+        stream: bool = False,
+        on_text_delta: Callable[[str], None] | None = None,
+        **kwargs,
+    ):
         """Call provider.generate with exponential backoff on retryable errors.
 
         Checks _cancel_event during backoff so cancellation is responsive
         even during retry waits.
         """
+        use_stream = (
+            stream
+            and on_text_delta is not None
+            and hasattr(self._provider, "generate_stream")
+        )
+        generate = self._provider.generate_stream if use_stream else self._provider.generate
+        if use_stream:
+            kwargs["on_text_delta"] = on_text_delta
+
         for attempt in range(1, self.RETRY_MAX_ATTEMPTS + 1):
             try:
-                return self._provider.generate(**kwargs)
+                return generate(**kwargs)
             except Exception as e:
                 if self._provider.is_retryable_error(e) and attempt < self.RETRY_MAX_ATTEMPTS:
                     delay = self._provider.get_retry_delay(
@@ -1146,6 +1161,7 @@ class Agent:
         max_output_tokens: int,
         cache_config: dict | None = None,
         save_history: bool = True,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> tuple[str, dict]:
         """Run the model with manual function calling loop.
 
@@ -1157,10 +1173,25 @@ class Agent:
                 Gemini uses ``{"cache_name": str, "contents_offset": int}``.
             save_history: Whether to persist history after each append.
                 True for stateful run(), False for run_stateless().
+            on_text_delta: Optional callback for provider text deltas.
         """
         iteration = 0
         total = TokenUsage()
         last_prompt = 0
+        safe_on_text_delta = None
+        if on_text_delta is not None:
+            def _safe_on_text_delta(delta: str) -> None:
+                if not delta:
+                    return
+                try:
+                    on_text_delta(delta)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] text delta callback failed: %s",
+                        self.name,
+                        exc,
+                    )
+            safe_on_text_delta = _safe_on_text_delta
 
         def _usage_dict() -> dict:
             offset = (cache_config or {}).get("contents_offset", 0)
@@ -1207,6 +1238,8 @@ class Agent:
                     max_output_tokens=max_output_tokens,
                     tool_schemas=self._tool_schemas,
                     cache_config=cache_config,
+                    stream=safe_on_text_delta is not None,
+                    on_text_delta=safe_on_text_delta,
                 )
             except Exception as exc:
                 overflow_markers = (
@@ -1266,7 +1299,10 @@ class Agent:
                         agent_type=self.name,
                         parent_agent=self._parent_agent,
                         wave_id=self._wave_id,
-                        details={"text": parsed.thinking_text},
+                        details={
+                            "text": parsed.thinking_text,
+                            "streamed": parsed.streamed_text,
+                        },
                     )
 
             if not parsed.tool_calls:
@@ -1429,6 +1465,8 @@ class Agent:
         temperature: float = 0.7,
         max_output_tokens: int = 32768,
         wait_for_cache: bool = False,
+        streaming: bool = False,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> str:
         """Run the agent with a prompt (maintains conversation history).
 
@@ -1439,6 +1477,8 @@ class Agent:
             wait_for_cache: If True, block until any pending cache creation
                 completes before the first generate call. Trades latency for
                 guaranteed cache savings on large contexts.
+            streaming: If True, use provider streaming when available.
+            on_text_delta: Callback invoked with incremental text chunks.
 
         Returns:
             The agent's final text response.
@@ -1454,6 +1494,7 @@ class Agent:
                 result, token_usage = self._run_with_function_loop(
                     self._history, temperature, max_output_tokens,
                     cache_config=cache_config,
+                    on_text_delta=on_text_delta if streaming else None,
                 )
             except Exception as e:
                 if cache_config and self._cache_enabled:
@@ -1461,6 +1502,7 @@ class Agent:
                     self._instance_cache_registry.invalidate(self.instance_id)
                     result, token_usage = self._run_with_function_loop(
                         self._history, temperature, max_output_tokens,
+                        on_text_delta=on_text_delta if streaming else None,
                     )
                 else:
                     raise
@@ -1484,6 +1526,8 @@ class Agent:
         context: dict[str, Any] | None = None,
         temperature: float = 0.7,
         max_output_tokens: int = 32768,
+        streaming: bool = False,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> str:
         """Run the agent without maintaining conversation history.
 
@@ -1494,6 +1538,8 @@ class Agent:
             context: Optional context dict to include in the prompt.
             temperature: Sampling temperature.
             max_output_tokens: Maximum tokens in response.
+            streaming: If True, use provider streaming when available.
+            on_text_delta: Callback invoked with incremental text chunks.
 
         Returns:
             The agent's final text response.
@@ -1506,7 +1552,11 @@ class Agent:
         def _execute() -> tuple[str, dict]:
             contents = [self._provider.build_user_message(full_prompt)]
             return self._run_with_function_loop(
-                contents, temperature, max_output_tokens, save_history=False,
+                contents,
+                temperature,
+                max_output_tokens,
+                save_history=False,
+                on_text_delta=on_text_delta if streaming else None,
             )
 
         return self._execute_run(full_prompt, _execute)

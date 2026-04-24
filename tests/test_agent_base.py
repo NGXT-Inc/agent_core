@@ -403,6 +403,26 @@ class TestConversationHistory:
         assert len(saved) == 4
         agent.close()
 
+    def test_run_streams_text_deltas(self, mock_env, mock_genai):
+        """run() should use provider streaming when explicitly requested."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content_stream.return_value = iter([
+            make_text_response("Hel"),
+            make_text_response("lo"),
+        ])
+
+        deltas = []
+        agent = Agent()
+        result = agent.run("hello", streaming=True, on_text_delta=deltas.append)
+
+        assert result == "Hello"
+        assert deltas == ["Hel", "lo"]
+        mock_client.models.generate_content.assert_not_called()
+        assert len(agent._history) == 2
+        agent.close()
+
 
 class TestLifecycleHooks:
     """Test that lifecycle hooks are called correctly."""

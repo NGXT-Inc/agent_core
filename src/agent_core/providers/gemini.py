@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from google import genai
@@ -19,6 +20,31 @@ from google.genai.errors import ClientError
 from agent_core.providers.types import ParsedResponse, TokenUsage, ToolCall
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _StreamCandidate:
+    content: Any
+
+
+class _StreamedGenerateContentResponse:
+    """Minimal response shape consumed by ``parse_response``.
+
+    The google-genai SDK yields partial ``GenerateContentResponse`` chunks.
+    The agent loop needs the same final response shape it receives from the
+    non-streaming API so history, tool calls, and usage accounting stay
+    unchanged.
+    """
+
+    def __init__(self, *, text: str, content: Any | None, usage_metadata: Any):
+        self._text = text
+        self.candidates = [_StreamCandidate(content)] if content is not None else []
+        self.usage_metadata = usage_metadata
+        self._agent_core_streamed_text = bool(text)
+
+    @property
+    def text(self) -> str:
+        return self._text
 
 
 class GeminiProvider:
@@ -59,17 +85,16 @@ class GeminiProvider:
     # Generation
     # ------------------------------------------------------------------
 
-    def generate(
+    def _build_generate_request(
         self,
-        model: str,
+        *,
         messages: list[Any],
         system_prompt: str | None,
         temperature: float,
         max_output_tokens: int,
         tool_schemas: Any | None = None,
-        *,
         cache_config: dict | None = None,
-    ) -> Any:
+    ) -> tuple[list[Any], Any]:
         if cache_config and cache_config.get("cache_name"):
             config = types.GenerateContentConfig(
                 cached_content=cache_config["cache_name"],
@@ -92,10 +117,111 @@ class GeminiProvider:
                 ),
             )
             contents = list(messages)  # copy — caller may mutate after return
+        return contents, config
+
+    def generate(
+        self,
+        model: str,
+        messages: list[Any],
+        system_prompt: str | None,
+        temperature: float,
+        max_output_tokens: int,
+        tool_schemas: Any | None = None,
+        *,
+        cache_config: dict | None = None,
+    ) -> Any:
+        contents, config = self._build_generate_request(
+            messages=messages,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            tool_schemas=tool_schemas,
+            cache_config=cache_config,
+        )
 
         return self._client.models.generate_content(
             model=model, contents=contents, config=config,
         )
+
+    def generate_stream(
+        self,
+        model: str,
+        messages: list[Any],
+        system_prompt: str | None,
+        temperature: float,
+        max_output_tokens: int,
+        tool_schemas: Any | None = None,
+        *,
+        cache_config: dict | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> Any:
+        contents, config = self._build_generate_request(
+            messages=messages,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            tool_schemas=tool_schemas,
+            cache_config=cache_config,
+        )
+
+        text_chunks: list[str] = []
+        text_buffer: list[str] = []
+        parts: list[Any] = []
+        role = "model"
+        usage_metadata = None
+        emitted_text = False
+
+        def flush_text_buffer() -> None:
+            if not text_buffer:
+                return
+            parts.append(types.Part.from_text(text="".join(text_buffer)))
+            text_buffer.clear()
+
+        for chunk in self._client.models.generate_content_stream(
+            model=model, contents=contents, config=config,
+        ):
+            if getattr(chunk, "usage_metadata", None) is not None:
+                usage_metadata = chunk.usage_metadata
+
+            candidates = getattr(chunk, "candidates", None) or []
+            if not candidates:
+                delta = getattr(chunk, "text", None)
+                if delta:
+                    text_chunks.append(delta)
+                    text_buffer.append(delta)
+                    if on_text_delta:
+                        on_text_delta(delta)
+                        emitted_text = True
+                continue
+
+            content = getattr(candidates[0], "content", None)
+            if content is None:
+                continue
+            role = getattr(content, "role", None) or role
+
+            for part in getattr(content, "parts", []) or []:
+                delta = getattr(part, "text", None)
+                if delta:
+                    text_chunks.append(delta)
+                    text_buffer.append(delta)
+                    if on_text_delta:
+                        on_text_delta(delta)
+                        emitted_text = True
+                    continue
+
+                flush_text_buffer()
+                parts.append(part)
+
+        flush_text_buffer()
+        text = "".join(text_chunks)
+        content = types.Content(role=role, parts=parts) if parts else None
+        response = _StreamedGenerateContentResponse(
+            text=text,
+            content=content,
+            usage_metadata=usage_metadata,
+        )
+        response._agent_core_streamed_text = emitted_text
+        return response
 
     def parse_response(self, response: Any) -> ParsedResponse:
         # Usage
@@ -113,6 +239,7 @@ class GeminiProvider:
                 tool_calls=[],
                 raw_message=None,
                 usage=usage,
+                streamed_text=bool(getattr(response, "_agent_core_streamed_text", False)),
             )
 
         model_content = response.candidates[0].content
@@ -150,6 +277,7 @@ class GeminiProvider:
             raw_message=model_content,
             usage=usage,
             thinking_text=thinking_text,
+            streamed_text=bool(getattr(response, "_agent_core_streamed_text", False)),
         )
 
     # ------------------------------------------------------------------
