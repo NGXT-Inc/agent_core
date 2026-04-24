@@ -1,6 +1,6 @@
 # Agent Core
 
-Extensible agent orchestration framework with Gemini function calling support.
+Extensible agent orchestration framework with multi-provider function calling support.
 
 ## Installation
 
@@ -112,8 +112,14 @@ agent = Agent(
 
 OpenRouter provider-side prompt caching is automatic for supported providers
 such as Moonshot/Kimi and DeepSeek. `OpenRouterProvider` also supports
-OpenRouter response caching for identical requests and parses cache usage from
+OpenRouter response caching for identical requests, preserves reasoning traces,
+streams responses, and parses cache usage from
 `prompt_tokens_details.cached_tokens` and `cache_write_tokens`.
+
+Gemini's explicit Vertex context cache remains available through
+`ContextCacheRegistry`. That cache registry is only used by Gemini providers;
+OpenRouter and other OpenAI-compatible providers use request-level cache
+controls instead.
 
 ## Configuration
 
@@ -125,7 +131,7 @@ Override these in your agent subclass:
 |-----------|---------|-------------|
 | `name` | `"base"` | Agent type identifier |
 | `system_prompt` | `"You are a helpful assistant."` | System prompt |
-| `DEFAULT_MODEL` | `"gemini-3-pro-preview"` | Model to use |
+| `DEFAULT_MODEL` | `"gemini-3.1-pro-preview"` | Model to use |
 | `ROOT_AGENT_TYPES` | `{"designer", "analyst", "data_analyst"}` | Types that get deterministic IDs |
 | `CODE_TOOLS` | `{"execute_code", ...}` | Tools that handle code (special formatting) |
 | `MAX_PARALLEL_TOOLS` | `10` | Max concurrent tool executions |
@@ -242,5 +248,6 @@ emit_event(
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GOOGLE_PROJECT_ID` | Yes | Google Cloud project ID |
+| `GOOGLE_PROJECT_ID` | For Gemini auto-client creation | Google Cloud project ID |
 | `GOOGLE_LOCATION` | No | Vertex AI location (default: "global") |
+| `OPENROUTER_API_KEY` | For OpenRouter auto-client creation | OpenRouter API key |

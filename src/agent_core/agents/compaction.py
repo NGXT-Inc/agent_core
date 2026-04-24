@@ -86,14 +86,6 @@ def estimate_history_tokens(provider, messages: list[Any], *, max_chars: int) ->
     return total
 
 
-def _is_function_response_message(provider, message: Any) -> bool:
-    serialized = provider.serialize_message(message)
-    if serialized.get("role") != "user":
-        return False
-    parts = serialized.get("parts", [])
-    return bool(parts) and all(part.get("type") == "function_response" for part in parts)
-
-
 def select_preserved_tail_start(
     provider,
     messages: list[Any],
@@ -120,11 +112,9 @@ def select_preserved_tail_start(
         kept += 1
         used_tokens += msg_tokens
 
-    while start > 0 and start < len(messages) and _is_function_response_message(
-        provider, messages[start]
-    ):
-        start -= 1
-
+    adjust_start = getattr(provider, "adjust_compaction_tail_start", None)
+    if adjust_start is not None:
+        start = adjust_start(messages, start)
     return max(0, start)
 
 

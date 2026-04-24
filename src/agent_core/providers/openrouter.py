@@ -56,6 +56,7 @@ class OpenRouterProvider(OpenAIProvider):
         base_url: OpenRouter API base URL.
         app_url: Optional ``HTTP-Referer`` attribution header.
         app_name: Optional ``X-Title`` attribution header.
+        include_stream_usage: Request usage accounting on streamed responses.
         response_cache: Enable OpenRouter response caching for identical
             requests. Defaults to ``False`` because it replays stale responses
             until TTL expiry.
@@ -73,6 +74,7 @@ class OpenRouterProvider(OpenAIProvider):
         app_url: str | None = None,
         app_name: str | None = None,
         preserve_reasoning: bool = True,
+        include_stream_usage: bool = True,
         extra_body: dict | None = None,
         extra_headers: dict | None = None,
         cache_config: OpenRouterCacheConfig | dict | None = None,
@@ -117,6 +119,7 @@ class OpenRouterProvider(OpenAIProvider):
         super().__init__(
             client=client,
             preserve_reasoning=preserve_reasoning,
+            include_stream_usage=include_stream_usage,
             extra_body=extra_body,
             extra_headers=headers,
             cache_config=cache_defaults or None,

@@ -1,6 +1,7 @@
 """Tests for provider implementations."""
 
 import json
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -262,7 +263,7 @@ class TestOpenAIProvider:
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert call_kwargs["extra_body"]["cache_control"] == {"type": "ephemeral"}
 
-    def test_generate_per_call_cache_config_overrides_default(self):
+    def test_response_cache_clear_enables_cache_refresh(self):
         provider, mock_client = self._make_provider(
             cache_config={"response_cache": True}
         )
@@ -279,8 +280,40 @@ class TestOpenAIProvider:
         )
 
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-        assert call_kwargs["extra_headers"]["X-OpenRouter-Cache"] == "false"
+        assert call_kwargs["extra_headers"]["X-OpenRouter-Cache"] == "true"
         assert call_kwargs["extra_headers"]["X-OpenRouter-Cache-Clear"] == "true"
+
+    def test_generate_stream_requests_usage_by_default(self):
+        provider, mock_client = self._make_provider()
+        mock_client.chat.completions.create.return_value = iter([])
+
+        provider.generate_stream(
+            model="gpt-4o",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=1000,
+            tool_schemas=None,
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["stream_options"] == {"include_usage": True}
+
+    def test_generate_stream_usage_request_can_be_disabled(self):
+        provider, mock_client = self._make_provider(include_stream_usage=False)
+        mock_client.chat.completions.create.return_value = iter([])
+
+        provider.generate_stream(
+            model="gpt-4o",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=1000,
+            tool_schemas=None,
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert "stream_options" not in call_kwargs
 
     def test_parse_text_response(self):
         provider, _ = self._make_provider()
@@ -326,6 +359,20 @@ class TestOpenAIProvider:
 
         parsed = provider.parse_response(response)
         assert parsed.thinking_text == "Let me count... s-t-r-a-w-b-e-r-r-y"
+
+    def test_parse_reasoning_details_supports_openrouter_shape(self):
+        provider, _ = self._make_provider(preserve_reasoning=True)
+
+        response = self._make_mock_response(
+            content="answer",
+            reasoning_details=[
+                {"type": "reasoning.text", "text": "Let me think. "},
+                {"type": "reasoning.summary", "summary": "Checked the result."},
+            ],
+        )
+
+        parsed = provider.parse_response(response)
+        assert parsed.thinking_text == "Let me think. Checked the result."
 
     def test_parse_reasoning_disabled(self):
         provider, _ = self._make_provider(preserve_reasoning=False)
@@ -414,6 +461,42 @@ class TestOpenAIProvider:
         assert result["role"] == "tool"
         assert "call_1" in result["content"]
 
+    def test_compaction_tail_start_moves_before_tool_results(self):
+        from agent_core.agents.compaction import select_preserved_tail_start
+
+        provider, _ = self._make_provider()
+        messages = [
+            {"role": "user", "content": "older"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "first"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "second"},
+            {"role": "user", "content": "latest"},
+        ]
+
+        start = select_preserved_tail_start(
+            provider,
+            messages,
+            tail_token_budget=1,
+            min_messages=2,
+            max_chars=1000,
+        )
+
+        assert start == 1
+
     def test_is_retryable_error(self):
         provider, _ = self._make_provider()
         # Generic exception is not retryable
@@ -434,6 +517,115 @@ class TestOpenAIProvider:
             tool_schemas=None,
             cache_config={"cache_name": "something", "contents_offset": 5},
         )
+
+    def test_generate_stream_preserves_reasoning_details(self):
+        provider, mock_client = self._make_provider(preserve_reasoning=True)
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+        mock_client.chat.completions.create.return_value = iter([
+            SimpleNamespace(
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            role="assistant",
+                            reasoning_details=[
+                                {
+                                    "type": "reasoning.text",
+                                    "text": "First thought. ",
+                                    "index": 0,
+                                }
+                            ],
+                        )
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            reasoning_details=[
+                                SimpleNamespace(
+                                    type="reasoning.summary",
+                                    summary="Then summary.",
+                                    index=1,
+                                )
+                            ],
+                            content="final",
+                        )
+                    )
+                ],
+            ),
+            SimpleNamespace(usage=usage, choices=[]),
+        ])
+
+        response = provider.generate_stream(
+            model="openrouter/reasoning-model",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=100,
+            tool_schemas=None,
+        )
+        parsed = provider.parse_response(response)
+
+        assert parsed.text == "final"
+        assert parsed.thinking_text == "First thought. Then summary."
+        assert parsed.raw_message["reasoning_details"] == [
+            {
+                "type": "reasoning.text",
+                "text": "First thought. ",
+                "index": 0,
+            },
+            {
+                "type": "reasoning.summary",
+                "summary": "Then summary.",
+                "index": 1,
+            },
+        ]
+        assert parsed.usage.prompt_tokens == 10
+        assert parsed.usage.completion_tokens == 5
+
+    def test_generate_stream_preserves_plain_reasoning(self):
+        provider, mock_client = self._make_provider(preserve_reasoning=True)
+        mock_client.chat.completions.create.return_value = iter([
+            SimpleNamespace(
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            role="assistant",
+                            reasoning="plain ",
+                        )
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            reasoning_content="reasoning",
+                            content="answer",
+                        )
+                    )
+                ],
+            ),
+        ])
+
+        response = provider.generate_stream(
+            model="openrouter/reasoning-model",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=100,
+            tool_schemas=None,
+        )
+        parsed = provider.parse_response(response)
+
+        assert parsed.text == "answer"
+        assert parsed.thinking_text == "plain reasoning"
+        assert parsed.raw_message["reasoning"] == "plain reasoning"
 
 
 # ============================================================

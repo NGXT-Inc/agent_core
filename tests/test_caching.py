@@ -954,6 +954,21 @@ class TestAgentCachingIntegration:
         self.mock_registry.register.assert_called_once()
         agent.close()
 
+    def test_openai_provider_does_not_register_gemini_cache(self):
+        """OpenAI-compatible providers must not use Gemini explicit cache state."""
+        from agent_core.providers.openai import OpenAIProvider
+
+        provider = OpenAIProvider(client=MagicMock())
+        agent = self.Agent(
+            provider=provider,
+            model_name="gpt-4o",
+            session_id="test-session",
+        )
+
+        assert agent._cache_enabled is False
+        self.mock_registry.register.assert_not_called()
+        agent.close()
+
     def test_no_cache_uses_base_config(self):
         """When registry returns no cache, agent uses base config."""
         self.mock_client.models.generate_content.return_value = make_text_response("ok")

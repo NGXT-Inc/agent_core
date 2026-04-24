@@ -58,12 +58,13 @@ class ParsedResponse:
 class LLMProvider(Protocol):
     """Protocol that every LLM backend must implement.
 
-    Methods fall into four groups:
+    Methods fall into five groups:
 
     1. **Generation** — call the model and parse its response.
     2. **Message construction** — build provider-specific messages.
-    3. **Error handling** — classify exceptions for the retry loop.
-    4. **Serialization** — persist / display messages.
+    3. **Runtime capabilities** — advertise cache and compaction behavior.
+    4. **Error handling** — classify exceptions for the retry loop.
+    5. **Serialization** — persist / display messages.
     """
 
     # --- Generation ---
@@ -157,6 +158,26 @@ class LLMProvider(Protocol):
         """Count tokens in the current context.
 
         Best-effort — providers without a token-counting API may return 0.
+        """
+        ...
+
+    # --- Runtime capabilities ---
+
+    def supports_context_cache_registry(self, cache_registry: Any) -> bool:
+        """Return whether this provider can use the given explicit cache registry.
+
+        The built-in ``ContextCacheRegistry`` creates Vertex/Gemini cached
+        content. OpenAI-compatible providers use request-level cache controls
+        instead and should return ``False``.
+        """
+        ...
+
+    def adjust_compaction_tail_start(self, messages: list[Any], start: int) -> int:
+        """Move a proposed compaction tail start to a provider-valid boundary.
+
+        Providers with paired tool-call/tool-result messages should move
+        ``start`` backward when needed so the preserved tail remains a valid
+        conversation transcript.
         """
         ...
 

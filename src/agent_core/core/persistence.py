@@ -2,7 +2,7 @@
 
 This module provides:
 1. ConversationStoreProtocol - Interface for conversation persistence
-2. InMemoryConversationStore - Simple in-memory implementation (default)
+2. InMemoryConversationStore - Simple in-memory implementation
 3. SQLiteConversationStore - File-based persistence (optional)
 
 Applications can implement their own stores (Redis, PostgreSQL, etc.)

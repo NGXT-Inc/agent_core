@@ -1,7 +1,7 @@
 [project]
 name = "agent-core"
 version = "0.1.0"
-description = "Core agent orchestration framework with Gemini function calling"
+description = "Core agent orchestration framework with multi-provider function calling"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,6 +16,9 @@ openai = [
 openai-tiktoken = [
     "openai>=1.0.0",
     "tiktoken>=0.5.0",
+]
+openrouter = [
+    "openai>=1.0.0",
 ]
 
 [build-system]

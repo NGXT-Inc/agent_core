@@ -39,7 +39,7 @@ from agent_core.agents.compaction import (
 )
 from agent_core.core.caching import ContextCacheRegistry
 from agent_core.core.events import EventBus, EventType, EventStatus, Event, get_event_bus, emit_event
-from agent_core.core.persistence import ConversationStoreProtocol, InMemoryConversationStore
+from agent_core.core.persistence import ConversationStoreProtocol
 from agent_core.providers.types import LLMProvider, ParsedResponse, TokenUsage, ToolCall
 
 # Default model constants (can be overridden at class level)
@@ -122,7 +122,7 @@ def generate_instance_id(
 class Agent:
     """Base class for all agents.
 
-    Agents are specialized Gemini instances with specific prompts and tools.
+    Agents are provider-backed LLM runtimes with specific prompts and tools.
     Uses manual function calling loop with parallel execution support.
 
     Class Attributes (override in subclasses):
@@ -245,8 +245,8 @@ class Agent:
             parent_agent: Instance ID of the parent agent (for graph visualization).
             session_id: Optional session ID for deterministic instance ID generation
                        and conversation persistence.
-            conversation_store: Optional persistence backend. If None and session_id
-                              is provided, uses InMemoryConversationStore.
+            conversation_store: Optional persistence backend. If None, history is
+                              kept in memory for the lifetime of this agent.
             cancel_event: Optional shared threading.Event for cancellation.
                          If provided, this agent shares the cancel signal with
                          its parent — calling cancel() on either stops both.
@@ -324,7 +324,12 @@ class Agent:
 
         # Register with cache registry (only for persistent sessions —
         # avoids overhead on short-lived sub-agents using run_stateless)
-        if self.ENABLE_CACHING and session_id and self._instance_cache_registry:
+        if (
+            self.ENABLE_CACHING
+            and session_id
+            and self._instance_cache_registry
+            and self._provider_supports_context_cache_registry()
+        ):
             self._instance_cache_registry.register(
                 agent_id=self.instance_id,
                 model_name=self.model_name,
@@ -333,6 +338,21 @@ class Agent:
             self._cache_enabled = True
         else:
             self._cache_enabled = False
+
+    def _provider_supports_context_cache_registry(self) -> bool:
+        """Return whether the active provider can use the configured registry."""
+        supports = getattr(self._provider, "supports_context_cache_registry", None)
+        if supports is None:
+            return False
+        try:
+            return bool(supports(self._instance_cache_registry))
+        except Exception as exc:
+            logger.warning(
+                "[%s] disabling context cache: provider capability check failed: %s",
+                self.name,
+                exc,
+            )
+            return False
 
     # --- Lifecycle Hooks (override in subclasses) ---
 

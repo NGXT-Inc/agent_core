@@ -435,6 +435,32 @@ class GeminiProvider:
             return 0
 
     # ------------------------------------------------------------------
+    # Runtime capabilities
+    # ------------------------------------------------------------------
+
+    def supports_context_cache_registry(self, cache_registry: Any) -> bool:
+        """Gemini can use the package's explicit Vertex context cache registry."""
+        return True
+
+    def adjust_compaction_tail_start(self, messages: list[Any], start: int) -> int:
+        """Keep Gemini function-response messages paired with their calls."""
+        start = max(0, min(start, len(messages)))
+        while (
+            start > 0
+            and start < len(messages)
+            and self._is_function_response_message(messages[start])
+        ):
+            start -= 1
+        return start
+
+    def _is_function_response_message(self, message: Any) -> bool:
+        serialized = self.serialize_message(message)
+        if serialized.get("role") != "user":
+            return False
+        parts = serialized.get("parts", [])
+        return any(part.get("type") == "function_response" for part in parts)
+
+    # ------------------------------------------------------------------
     # Error handling
     # ------------------------------------------------------------------
 

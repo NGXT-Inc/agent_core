@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import asdict, is_dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -38,6 +39,17 @@ def _json_safe(value: Any) -> Any:
     """Return a JSON-compatible representation while preserving structure."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if hasattr(value, "model_dump"):
+        try:
+            return _json_safe(value.model_dump(mode="json"))
+        except TypeError:
+            return _json_safe(value.model_dump())
+    if hasattr(value, "dict") and callable(value.dict):
+        return _json_safe(value.dict())
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_safe(asdict(value))
+    if isinstance(value, SimpleNamespace):
+        return _json_safe(vars(value))
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     if isinstance(value, tuple):
@@ -45,6 +57,39 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items()}
     return str(value)
+
+
+def _coerce_reasoning_details(value: Any) -> list[Any]:
+    """Normalize streamed reasoning_details chunks into JSON-safe blocks."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return [_json_safe(value)]
+
+
+def _reasoning_text(value: Any) -> str:
+    """Extract displayable reasoning text from OpenRouter reasoning payloads."""
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "".join(_reasoning_text(item) for item in value)
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ("content", "text", "summary"):
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                parts.append(item)
+        return "".join(parts)
+
+    content = getattr(value, "content", None)
+    text = getattr(value, "text", None)
+    summary = getattr(value, "summary", None)
+    return "".join(
+        item for item in (content, text, summary) if isinstance(item, str) and item
+    )
 
 
 def _read_field(value: Any, name: str, default: Any = None) -> Any:
@@ -102,6 +147,8 @@ class OpenAIProvider:
             ``response_cache`` (bool), ``response_cache_ttl_seconds`` (int),
             ``response_cache_clear`` (bool), and ``cache_control``/``prompt_cache_control``
             (dict). Per-call ``cache_config`` values override these defaults.
+        include_stream_usage: If ``True``, request usage accounting on streamed
+            OpenAI-compatible responses where the API supports it.
     """
 
     def __init__(
@@ -112,12 +159,14 @@ class OpenAIProvider:
         extra_body: dict | None = None,
         extra_headers: dict | None = None,
         cache_config: dict | None = None,
+        include_stream_usage: bool = True,
     ) -> None:
         self._client = client
         self._preserve_reasoning = preserve_reasoning
         self._extra_body = extra_body or {}
         self._extra_headers = extra_headers or {}
         self._cache_config = cache_config or {}
+        self._include_stream_usage = include_stream_usage
 
     @property
     def client(self) -> Any:
@@ -183,6 +232,8 @@ class OpenAIProvider:
         }
         if tool_schemas:
             kwargs["tools"] = tool_schemas
+        if self._include_stream_usage:
+            kwargs["stream_options"] = {"include_usage": True}
         self._apply_request_options(kwargs, cache_config)
 
         text_chunks: list[str] = []
@@ -190,6 +241,8 @@ class OpenAIProvider:
         role = "assistant"
         streamed_text = False
         tool_calls_by_index: dict[int, dict[str, Any]] = {}
+        reasoning_details: list[Any] = []
+        reasoning_chunks: list[str] = []
 
         for chunk in self._client.chat.completions.create(**kwargs):
             if getattr(chunk, "usage", None) is not None:
@@ -203,6 +256,20 @@ class OpenAIProvider:
                 continue
 
             role = getattr(delta, "role", None) or role
+
+            delta_reasoning_details = getattr(delta, "reasoning_details", None)
+            if delta_reasoning_details:
+                reasoning_details.extend(
+                    _coerce_reasoning_details(delta_reasoning_details)
+                )
+
+            delta_reasoning = (
+                getattr(delta, "reasoning", None)
+                or getattr(delta, "reasoning_content", None)
+            )
+            if delta_reasoning:
+                reasoning_chunks.append(str(delta_reasoning))
+
             content = getattr(delta, "content", None)
             if content:
                 text_chunks.append(content)
@@ -243,8 +310,8 @@ class OpenAIProvider:
             role=role,
             content="".join(text_chunks) or None,
             tool_calls=tool_calls or None,
-            reasoning_details=None,
-            reasoning=None,
+            reasoning_details=reasoning_details or None,
+            reasoning="".join(reasoning_chunks) or None,
         )
         return _StreamedOpenAIResponse(
             message=message,
@@ -277,13 +344,7 @@ class OpenAIProvider:
         if self._preserve_reasoning:
             rd = getattr(message, "reasoning_details", None) or getattr(message, "reasoning", None)
             if rd:
-                if isinstance(rd, list):
-                    thinking_text = "".join(
-                        item.get("content", "") if isinstance(item, dict) else str(item)
-                        for item in rd
-                    )
-                elif isinstance(rd, str):
-                    thinking_text = rd
+                thinking_text = _reasoning_text(rd)
 
         usage = TokenUsage()
         response_usage = getattr(response, "usage", None)
@@ -374,6 +435,29 @@ class OpenAIProvider:
             else:
                 total += len(enc.encode(str(msg))) + 4
         return total
+
+    # ------------------------------------------------------------------
+    # Runtime capabilities
+    # ------------------------------------------------------------------
+
+    def supports_context_cache_registry(self, cache_registry: Any) -> bool:
+        """OpenAI-compatible providers do not use Gemini explicit caches."""
+        return False
+
+    def adjust_compaction_tail_start(self, messages: list[Any], start: int) -> int:
+        """Keep OpenAI tool-result messages paired with assistant tool calls."""
+        start = max(0, min(start, len(messages)))
+        while (
+            start > 0
+            and start < len(messages)
+            and self._is_tool_result_message(messages[start])
+        ):
+            start -= 1
+        return start
+
+    @staticmethod
+    def _is_tool_result_message(message: Any) -> bool:
+        return isinstance(message, dict) and message.get("role") == "tool"
 
     # ------------------------------------------------------------------
     # Error handling
@@ -470,7 +554,10 @@ class OpenAIProvider:
         if self._preserve_reasoning:
             rd = getattr(message, "reasoning_details", None) or getattr(message, "reasoning", None)
             if rd:
-                msg["reasoning_details"] = rd
+                if getattr(message, "reasoning_details", None):
+                    msg["reasoning_details"] = _json_safe(rd)
+                else:
+                    msg["reasoning"] = _reasoning_text(rd) or str(rd)
 
         return msg
 
@@ -494,6 +581,8 @@ class OpenAIProvider:
             extra_body["cache_control"] = prompt_cache_control
 
         response_cache = merged_cache.get("response_cache")
+        if merged_cache.get("response_cache_clear"):
+            response_cache = True
         if response_cache is not None:
             extra_headers["X-OpenRouter-Cache"] = (
                 "true" if response_cache else "false"
