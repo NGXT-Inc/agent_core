@@ -22,6 +22,23 @@ from agent_core.providers.types import ParsedResponse, TokenUsage, ToolCall
 logger = logging.getLogger(__name__)
 
 
+def _json_safe(value: Any) -> Any:
+    """Return a JSON-compatible representation while preserving structure."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def _is_file_attachment(value: Any) -> bool:
+    return isinstance(value, dict) and ("data" in value or "gcs_uri" in value)
+
+
 @dataclass(slots=True)
 class _StreamCandidate:
     content: Any
@@ -312,26 +329,29 @@ class GeminiProvider:
             file_attachments: list[dict] = []
 
             if isinstance(result, dict):
-                # Only extract file attachments when the value is a list
-                # of attachment dicts. Tools like read_github_files return
-                # {"files": {path: content}} which is NOT an attachment list.
-                raw_files = result.get("files")
-                raw_images = result.get("images")
-                files_list = raw_files if isinstance(raw_files, list) else []
-                images_list = raw_images if isinstance(raw_images, list) else []
-                file_attachments = files_list + images_list
-
-                # Strip attachment keys only when they were actual attachments
-                exclude = set()
-                if isinstance(raw_files, list):
-                    exclude.add("files")
-                if isinstance(raw_images, list):
-                    exclude.add("images")
-                response_data = {
-                    k: v for k, v in result.items() if k not in exclude
-                }
+                # Only extract real file attachments. Normal structured
+                # outputs like {"files": ["a.py"]} stay in the tool response.
+                response_data = dict(result)
+                for key in ("files", "images"):
+                    raw_items = result.get(key)
+                    if not isinstance(raw_items, list):
+                        continue
+                    attachments = [
+                        item for item in raw_items if _is_file_attachment(item)
+                    ]
+                    if not attachments:
+                        continue
+                    file_attachments.extend(attachments)
+                    remaining = [
+                        item for item in raw_items if not _is_file_attachment(item)
+                    ]
+                    if remaining:
+                        response_data[key] = remaining
+                    else:
+                        response_data.pop(key, None)
+                response_data = _json_safe(response_data)
             else:
-                response_data = {"result": str(result)}
+                response_data = {"result": _json_safe(result)}
 
             parts.append(
                 types.Part.from_function_response(

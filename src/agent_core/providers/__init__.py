@@ -17,3 +17,10 @@ __all__ = [
     "TokenUsage",
     "ToolCall",
 ]
+
+try:
+    from agent_core.providers.openrouter import OpenRouterCacheConfig, OpenRouterProvider
+
+    __all__.extend(["OpenRouterProvider", "OpenRouterCacheConfig"])
+except ImportError:
+    pass

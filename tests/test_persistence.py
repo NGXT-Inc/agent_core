@@ -196,6 +196,32 @@ class TestSQLiteConversationStore:
         loaded = store.load("s1", "a1")
         assert len(loaded) == 2
 
+    def test_openai_dict_messages_roundtrip_without_provider(self, temp_db):
+        """OpenAI-style dict histories should not need a provider argument."""
+        store = SQLiteConversationStore(temp_db)
+        history = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": "{\"query\": \"x\"}",
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\": true}"},
+        ]
+
+        store.save("s-openai", "agent", history)
+        loaded = store.load("s-openai", "agent")
+
+        assert loaded == history
+
 
 class TestSerialization:
     """Test Content serialization/deserialization helpers."""

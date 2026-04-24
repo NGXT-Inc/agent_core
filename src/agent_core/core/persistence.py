@@ -200,6 +200,8 @@ def serialize_message(message: Any, provider: Any = None) -> dict[str, Any]:
     """
     if provider is not None:
         return provider.serialize_message(message)
+    if isinstance(message, dict):
+        return {**message, "_provider": message.get("_provider", "openai")}
     return serialize_content(message)
 
 
@@ -211,6 +213,10 @@ def deserialize_message(data: dict[str, Any], provider: Any = None) -> Any:
     """
     if provider is not None:
         return provider.deserialize_message(data)
+    if data.get("_provider") == "openai":
+        message = dict(data)
+        message.pop("_provider", None)
+        return message
     return deserialize_content(data)
 
 

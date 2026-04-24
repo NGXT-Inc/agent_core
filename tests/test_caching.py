@@ -523,6 +523,26 @@ class TestInvalidate:
         finally:
             registry.close()
 
+    def test_running_pending_cache_deleted_after_invalidate(self):
+        """A running creation future should clean up its cache when it finishes."""
+        mock_client = MagicMock()
+        registry = ContextCacheRegistry(mock_client, max_workers=1)
+        try:
+            registry.register("agent-1", "test-model")
+            slot = registry._slots["agent-1"]
+            future = Future()
+            assert future.set_running_or_notify_cancel()
+            slot.pending = future
+            slot.pending_through_index = 3
+
+            registry.invalidate("agent-1")
+            assert slot.pending is None
+
+            future.set_result("cachedContents/late")
+            mock_client.caches.delete.assert_called_with(name="cachedContents/late")
+        finally:
+            registry.close()
+
     def test_tolerates_delete_failure(self):
         """invalidate should not raise if remote deletion fails."""
         mock_client = MagicMock()

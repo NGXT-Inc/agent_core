@@ -34,6 +34,7 @@ class TokenUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass(slots=True)

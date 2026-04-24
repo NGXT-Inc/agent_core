@@ -179,6 +179,9 @@ class Agent:
     # Context compaction
     ENABLE_COMPACTION: ClassVar[bool] = False
 
+    # Streaming
+    DEFAULT_STREAMING: ClassVar[bool] = False
+
     # Shared cache registry (initialized once at app startup)
     _cache_registry: ClassVar[ContextCacheRegistry | None] = None
 
@@ -228,6 +231,7 @@ class Agent:
         cancel_event: threading.Event | None = None,
         event_bus: EventBus | None = None,
         cache_registry: ContextCacheRegistry | None = None,
+        streaming: bool | None = None,
     ):
         """Initialize the agent.
 
@@ -253,6 +257,9 @@ class Agent:
             cache_registry: Optional ContextCacheRegistry instance. If None,
                           falls back to the class-level _cache_registry.
                           Pass a custom instance for per-agent-tree isolation.
+            streaming: Optional default for run()/run_stateless(). If None,
+                       uses class DEFAULT_STREAMING. Per-call arguments
+                       still take priority.
         """
         from agent_core.providers.gemini import GeminiProvider
 
@@ -272,6 +279,7 @@ class Agent:
             )
 
         self.model_name = model_name or self.DEFAULT_MODEL
+        self.streaming = self.DEFAULT_STREAMING if streaming is None else streaming
 
         # Generate unique instance ID
         self.instance_id = generate_instance_id(self.name, session_id, self.ROOT_AGENT_TYPES)
@@ -955,6 +963,25 @@ class Agent:
         config = self.get_compaction_config()
         if not config.enabled or self._compaction_count >= config.max_compactions_per_run:
             return False, TokenUsage()
+        invalid_fields = [
+            field
+            for field in (
+                "trigger_tokens",
+                "tail_token_budget",
+                "summary_max_output_tokens",
+                "max_transcript_chars",
+                "max_message_chars",
+                "max_compactions_per_run",
+            )
+            if getattr(config, field) <= 0
+        ]
+        if invalid_fields:
+            logger.warning(
+                "Compaction disabled for agent %s: invalid config fields: %s",
+                self.name,
+                ", ".join(invalid_fields),
+            )
+            return False, TokenUsage()
         if len(contents) < max(2, config.min_preserved_messages + 1):
             return False, TokenUsage()
 
@@ -1073,10 +1100,12 @@ class Agent:
         always collected; cancelled/pending tools get an error placeholder.
         """
         results: list[tuple[str, Any] | None] = [None] * len(tool_calls)
-
-        with ThreadPoolExecutor(
+        executor = ThreadPoolExecutor(
             max_workers=min(len(tool_calls), self.MAX_PARALLEL_TOOLS)
-        ) as executor:
+        )
+        cancelled = False
+
+        try:
             future_to_idx = {
                 executor.submit(self._execute_tool, tc): idx
                 for idx, tc in enumerate(tool_calls)
@@ -1097,12 +1126,19 @@ class Agent:
 
                 if self._cancel_event.is_set() and remaining:
                     # Cancel pending futures and fill placeholders
+                    cancelled = True
                     for future in remaining:
                         future.cancel()
                         idx = future_to_idx[future]
                         func_name = tool_calls[idx].name
                         results[idx] = (func_name, {"error": "Cancelled"})
                     break
+        finally:
+            executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
+
+        for idx, result in enumerate(results):
+            if result is None:
+                results[idx] = (tool_calls[idx].name, {"error": "Cancelled"})
 
         return results
 
@@ -1127,7 +1163,6 @@ class Agent:
         """
         use_stream = (
             stream
-            and on_text_delta is not None
             and hasattr(self._provider, "generate_stream")
         )
         generate = self._provider.generate_stream if use_stream else self._provider.generate
@@ -1161,6 +1196,7 @@ class Agent:
         max_output_tokens: int,
         cache_config: dict | None = None,
         save_history: bool = True,
+        streaming: bool = False,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> tuple[str, dict]:
         """Run the model with manual function calling loop.
@@ -1173,6 +1209,7 @@ class Agent:
                 Gemini uses ``{"cache_name": str, "contents_offset": int}``.
             save_history: Whether to persist history after each append.
                 True for stateful run(), False for run_stateless().
+            streaming: Whether to use provider streaming transport.
             on_text_delta: Optional callback for provider text deltas.
         """
         iteration = 0
@@ -1200,6 +1237,7 @@ class Agent:
                 "completion_tokens": total.completion_tokens,
                 "total_tokens": total.prompt_tokens + total.completion_tokens,
                 "cached_tokens": total.cached_tokens,
+                "cache_write_tokens": total.cache_write_tokens,
                 "cache_type": (
                     ("explicit" if offset > 0 else "implicit")
                     if total.cached_tokens else None
@@ -1223,6 +1261,7 @@ class Agent:
                 total.prompt_tokens += compaction_usage.prompt_tokens
                 total.completion_tokens += compaction_usage.completion_tokens
                 total.cached_tokens += compaction_usage.cached_tokens
+                total.cache_write_tokens += compaction_usage.cache_write_tokens
                 if not compacted:
                     break
                 cache_config = None
@@ -1238,7 +1277,7 @@ class Agent:
                     max_output_tokens=max_output_tokens,
                     tool_schemas=self._tool_schemas,
                     cache_config=cache_config,
-                    stream=safe_on_text_delta is not None,
+                    stream=streaming,
                     on_text_delta=safe_on_text_delta,
                 )
             except Exception as exc:
@@ -1258,6 +1297,7 @@ class Agent:
                     total.prompt_tokens += compaction_usage.prompt_tokens
                     total.completion_tokens += compaction_usage.completion_tokens
                     total.cached_tokens += compaction_usage.cached_tokens
+                    total.cache_write_tokens += compaction_usage.cache_write_tokens
                     if compacted:
                         cache_config = None
                         iteration -= 1
@@ -1275,6 +1315,7 @@ class Agent:
             total.prompt_tokens += parsed.usage.prompt_tokens
             total.completion_tokens += parsed.usage.completion_tokens
             total.cached_tokens += parsed.usage.cached_tokens
+            total.cache_write_tokens += parsed.usage.cache_write_tokens
 
             if last_prompt:
                 offset = (cache_config or {}).get("contents_offset", 0)
@@ -1287,6 +1328,13 @@ class Agent:
                     "[%s] iter=%d cache=%s: %d cached / %d prompt tokens (%d%%)",
                     self.name, iteration, cache_label,
                     parsed.usage.cached_tokens, last_prompt, pct,
+                )
+            if parsed.usage.cache_write_tokens:
+                logger.info(
+                    "[%s] iter=%d cache write: %d prompt tokens",
+                    self.name,
+                    iteration,
+                    parsed.usage.cache_write_tokens,
                 )
 
             # Emit intermediate thinking text alongside tool calls
@@ -1465,7 +1513,7 @@ class Agent:
         temperature: float = 0.7,
         max_output_tokens: int = 32768,
         wait_for_cache: bool = False,
-        streaming: bool = False,
+        streaming: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> str:
         """Run the agent with a prompt (maintains conversation history).
@@ -1477,7 +1525,8 @@ class Agent:
             wait_for_cache: If True, block until any pending cache creation
                 completes before the first generate call. Trades latency for
                 guaranteed cache savings on large contexts.
-            streaming: If True, use provider streaming when available.
+            streaming: If True, use provider streaming when available. If
+                None, uses this agent's configured streaming default.
             on_text_delta: Callback invoked with incremental text chunks.
 
         Returns:
@@ -1485,6 +1534,7 @@ class Agent:
         """
 
         def _execute() -> tuple[str, dict]:
+            use_streaming = self.streaming if streaming is None else streaming
             self._history.append(self._provider.build_user_message(prompt))
             self._save_history()
 
@@ -1494,7 +1544,8 @@ class Agent:
                 result, token_usage = self._run_with_function_loop(
                     self._history, temperature, max_output_tokens,
                     cache_config=cache_config,
-                    on_text_delta=on_text_delta if streaming else None,
+                    streaming=use_streaming,
+                    on_text_delta=on_text_delta if use_streaming else None,
                 )
             except Exception as e:
                 if cache_config and self._cache_enabled:
@@ -1502,7 +1553,8 @@ class Agent:
                     self._instance_cache_registry.invalidate(self.instance_id)
                     result, token_usage = self._run_with_function_loop(
                         self._history, temperature, max_output_tokens,
-                        on_text_delta=on_text_delta if streaming else None,
+                        streaming=use_streaming,
+                        on_text_delta=on_text_delta if use_streaming else None,
                     )
                 else:
                     raise
@@ -1526,7 +1578,7 @@ class Agent:
         context: dict[str, Any] | None = None,
         temperature: float = 0.7,
         max_output_tokens: int = 32768,
-        streaming: bool = False,
+        streaming: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> str:
         """Run the agent without maintaining conversation history.
@@ -1538,7 +1590,8 @@ class Agent:
             context: Optional context dict to include in the prompt.
             temperature: Sampling temperature.
             max_output_tokens: Maximum tokens in response.
-            streaming: If True, use provider streaming when available.
+            streaming: If True, use provider streaming when available. If
+                None, uses this agent's configured streaming default.
             on_text_delta: Callback invoked with incremental text chunks.
 
         Returns:
@@ -1551,12 +1604,14 @@ class Agent:
 
         def _execute() -> tuple[str, dict]:
             contents = [self._provider.build_user_message(full_prompt)]
+            use_streaming = self.streaming if streaming is None else streaming
             return self._run_with_function_loop(
                 contents,
                 temperature,
                 max_output_tokens,
                 save_history=False,
-                on_text_delta=on_text_delta if streaming else None,
+                streaming=use_streaming,
+                on_text_delta=on_text_delta if use_streaming else None,
             )
 
         return self._execute_run(full_prompt, _execute)

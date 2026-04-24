@@ -118,6 +118,8 @@ class TestOpenAIProvider:
         reasoning_details=None,
         prompt_tokens=100,
         completion_tokens=50,
+        cached_tokens=0,
+        cache_write_tokens=0,
     ):
         """Build a mock OpenAI response."""
         msg = MagicMock()
@@ -129,6 +131,13 @@ class TestOpenAIProvider:
         usage = MagicMock()
         usage.prompt_tokens = prompt_tokens
         usage.completion_tokens = completion_tokens
+        if cached_tokens or cache_write_tokens:
+            usage.prompt_tokens_details = {
+                "cached_tokens": cached_tokens,
+                "cache_write_tokens": cache_write_tokens,
+            }
+        else:
+            usage.prompt_tokens_details = None
 
         choice = MagicMock()
         choice.message = msg
@@ -213,6 +222,66 @@ class TestOpenAIProvider:
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert call_kwargs["extra_body"] == {"reasoning": {"enabled": True}}
 
+    def test_generate_applies_openrouter_cache_headers(self):
+        provider, mock_client = self._make_provider(
+            cache_config={
+                "response_cache": True,
+                "response_cache_ttl_seconds": 600,
+            }
+        )
+        mock_client.chat.completions.create.return_value = self._make_mock_response()
+
+        provider.generate(
+            model="moonshotai/kimi-k2.6",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=1000,
+            tool_schemas=None,
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_headers"]["X-OpenRouter-Cache"] == "true"
+        assert call_kwargs["extra_headers"]["X-OpenRouter-Cache-TTL"] == "600"
+
+    def test_generate_applies_prompt_cache_control(self):
+        provider, mock_client = self._make_provider(
+            cache_config={"prompt_cache_control": {"type": "ephemeral"}}
+        )
+        mock_client.chat.completions.create.return_value = self._make_mock_response()
+
+        provider.generate(
+            model="anthropic/claude-sonnet-4.6",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=1000,
+            tool_schemas=None,
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_body"]["cache_control"] == {"type": "ephemeral"}
+
+    def test_generate_per_call_cache_config_overrides_default(self):
+        provider, mock_client = self._make_provider(
+            cache_config={"response_cache": True}
+        )
+        mock_client.chat.completions.create.return_value = self._make_mock_response()
+
+        provider.generate(
+            model="deepseek/deepseek-v4-pro",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=1000,
+            tool_schemas=None,
+            cache_config={"response_cache": False, "response_cache_clear": True},
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_headers"]["X-OpenRouter-Cache"] == "false"
+        assert call_kwargs["extra_headers"]["X-OpenRouter-Cache-Clear"] == "true"
+
     def test_parse_text_response(self):
         provider, _ = self._make_provider()
         response = self._make_mock_response(content="Hello world")
@@ -222,6 +291,18 @@ class TestOpenAIProvider:
         assert parsed.tool_calls == []
         assert parsed.usage.prompt_tokens == 100
         assert parsed.usage.completion_tokens == 50
+
+    def test_parse_cache_usage_details(self):
+        provider, _ = self._make_provider()
+        response = self._make_mock_response(
+            content="Hello world",
+            cached_tokens=80,
+            cache_write_tokens=20,
+        )
+
+        parsed = provider.parse_response(response)
+        assert parsed.usage.cached_tokens == 80
+        assert parsed.usage.cache_write_tokens == 20
 
     def test_parse_tool_call_response(self):
         provider, _ = self._make_provider()
@@ -282,6 +363,19 @@ class TestOpenAIProvider:
         assert json.loads(msgs[0]["content"]) == {"results": ["a", "b"]}
         assert msgs[1]["tool_call_id"] == "call_2"
 
+    def test_build_tool_result_messages_preserves_list_result(self):
+        provider, _ = self._make_provider()
+
+        msgs = provider.build_tool_result_messages(
+            [ToolCall(id="call_1", name="search", args={})],
+            [("search", [{"title": "A"}, {"title": "B"}])],
+        )
+
+        assert json.loads(msgs[0]["content"]) == [
+            {"title": "A"},
+            {"title": "B"},
+        ]
+
     def test_build_tool_schemas(self):
         provider, _ = self._make_provider()
 
@@ -340,6 +434,78 @@ class TestOpenAIProvider:
             tool_schemas=None,
             cache_config={"cache_name": "something", "contents_offset": 5},
         )
+
+
+# ============================================================
+# OpenRouterProvider tests
+# ============================================================
+
+
+class TestOpenRouterProvider:
+    """Test OpenRouter-specific provider configuration."""
+
+    def test_provider_applies_attribution_and_response_cache_headers(self):
+        from agent_core.providers.openrouter import OpenRouterProvider
+
+        mock_client = MagicMock()
+        provider = OpenRouterProvider(
+            client=mock_client,
+            app_url="https://example.com",
+            app_name="Agent Core",
+            response_cache=True,
+            response_cache_ttl_seconds=900,
+        )
+        mock_client.chat.completions.create.return_value = (
+            TestOpenAIProvider()._make_mock_response()
+        )
+
+        provider.generate(
+            model="moonshotai/kimi-k2.6",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=1000,
+            tool_schemas=None,
+        )
+
+        headers = mock_client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert headers["HTTP-Referer"] == "https://example.com"
+        assert headers["X-Title"] == "Agent Core"
+        assert headers["X-OpenRouter-Cache"] == "true"
+        assert headers["X-OpenRouter-Cache-TTL"] == "900"
+
+    def test_cache_config_dataclass_maps_to_request_options(self):
+        from agent_core.providers.openrouter import (
+            OpenRouterCacheConfig,
+            OpenRouterProvider,
+        )
+
+        mock_client = MagicMock()
+        provider = OpenRouterProvider(
+            client=mock_client,
+            cache_config=OpenRouterCacheConfig(
+                response_cache=True,
+                response_cache_ttl_seconds=300,
+                prompt_cache_control={"type": "ephemeral"},
+            ),
+        )
+        mock_client.chat.completions.create.return_value = (
+            TestOpenAIProvider()._make_mock_response()
+        )
+
+        provider.generate(
+            model="deepseek/deepseek-v4-pro",
+            messages=[],
+            system_prompt=None,
+            temperature=0.7,
+            max_output_tokens=1000,
+            tool_schemas=None,
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_headers"]["X-OpenRouter-Cache"] == "true"
+        assert call_kwargs["extra_headers"]["X-OpenRouter-Cache-TTL"] == "300"
+        assert call_kwargs["extra_body"]["cache_control"] == {"type": "ephemeral"}
 
 
 # ============================================================
@@ -424,6 +590,34 @@ class TestGeminiProvider:
                 provider.build_user_message("hello")
                 mock_types.Content.assert_called_once()
 
+    def test_build_tool_result_messages_preserves_regular_files_list(self, mock_genai):
+        from agent_core.providers.gemini import GeminiProvider
+
+        mock_client = mock_genai.Client.return_value
+        provider = GeminiProvider(client=mock_client)
+
+        msg = provider.build_tool_result_messages(
+            [ToolCall(id="call_1", name="list_files", args={})],
+            [("list_files", {"files": ["a.py", "b.py"], "count": 2})],
+        )
+
+        response = msg.parts[0].function_response.response
+        assert response == {"files": ["a.py", "b.py"], "count": 2}
+
+    def test_build_tool_result_messages_preserves_list_result(self, mock_genai):
+        from agent_core.providers.gemini import GeminiProvider
+
+        mock_client = mock_genai.Client.return_value
+        provider = GeminiProvider(client=mock_client)
+
+        msg = provider.build_tool_result_messages(
+            [ToolCall(id="call_1", name="search", args={})],
+            [("search", [{"title": "A"}, {"title": "B"}])],
+        )
+
+        response = msg.parts[0].function_response.response
+        assert response == {"result": [{"title": "A"}, {"title": "B"}]}
+
     def test_generate_stream_aggregates_text_chunks(self, mock_genai):
         from agent_core.providers.gemini import GeminiProvider
 
@@ -466,3 +660,7 @@ class TestProtocolCompliance:
     def test_openai_is_llm_provider(self):
         from agent_core.providers.openai import OpenAIProvider
         assert issubclass(OpenAIProvider, LLMProvider)
+
+    def test_openrouter_is_llm_provider(self):
+        from agent_core.providers.openrouter import OpenRouterProvider
+        assert issubclass(OpenRouterProvider, LLMProvider)

@@ -45,3 +45,9 @@ try:
     __all__.append("OpenAIProvider")
 except ImportError:
     pass
+
+try:
+    from agent_core.providers.openrouter import OpenRouterCacheConfig, OpenRouterProvider
+    __all__.extend(["OpenRouterProvider", "OpenRouterCacheConfig"])
+except ImportError:
+    pass

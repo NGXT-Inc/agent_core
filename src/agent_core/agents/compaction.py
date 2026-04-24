@@ -12,14 +12,14 @@ class CompactionConfig:
     """Policy for automatic context compaction."""
 
     enabled: bool = False
-    model_limit_tokens: int = 0
-    trigger_tokens: int = 0
-    target_tokens: int = 0
-    tail_token_budget: int = 0
-    response_buffer_tokens: int = 0
-    summary_max_output_tokens: int = 0
-    max_transcript_chars: int = 0
-    max_message_chars: int = 0
+    model_limit_tokens: int = 1_000_000
+    trigger_tokens: int = 800_000
+    target_tokens: int = 500_000
+    tail_token_budget: int = 120_000
+    response_buffer_tokens: int = 32_768
+    summary_max_output_tokens: int = 4096
+    max_transcript_chars: int = 120_000
+    max_message_chars: int = 12_000
     min_preserved_messages: int = 4
     max_compactions_per_run: int = 1
 

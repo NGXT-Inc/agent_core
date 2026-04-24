@@ -76,9 +76,44 @@ response = agent.run(
 )
 ```
 
+You can also make streaming the default for an agent and override it per call:
+
+```python
+class StreamingResearcherAgent(ResearcherAgent):
+    DEFAULT_STREAMING = True
+
+agent = StreamingResearcherAgent()
+response = agent.run("Explain recent work on retrieval-augmented generation")
+plain_response = agent.run("Summarize this briefly", streaming=False)
+```
+
 Streaming is transport-agnostic: applications decide whether deltas go to SSE,
 websockets, a terminal, or nowhere. The final response is still returned from
 `run()` and persisted through the configured conversation store.
+
+### OpenRouter Models And Caching
+
+Use `OpenRouterProvider` for OpenRouter-hosted models such as Kimi and
+DeepSeek:
+
+```python
+from agent_core import Agent, OpenRouterProvider
+
+provider = OpenRouterProvider(
+    response_cache=True,
+    response_cache_ttl_seconds=300,
+)
+agent = Agent(
+    provider=provider,
+    model_name="moonshotai/kimi-k2.6",
+    streaming=True,
+)
+```
+
+OpenRouter provider-side prompt caching is automatic for supported providers
+such as Moonshot/Kimi and DeepSeek. `OpenRouterProvider` also supports
+OpenRouter response caching for identical requests and parses cache usage from
+`prompt_tokens_details.cached_tokens` and `cache_write_tokens`.
 
 ## Configuration
 
@@ -95,6 +130,7 @@ Override these in your agent subclass:
 | `CODE_TOOLS` | `{"execute_code", ...}` | Tools that handle code (special formatting) |
 | `MAX_PARALLEL_TOOLS` | `10` | Max concurrent tool executions |
 | `MAX_ITERATIONS` | `50` | Max function calling loop iterations |
+| `DEFAULT_STREAMING` | `False` | Use provider streaming by default |
 | `emit_lifecycle_events` | `True` | Emit AGENT_START/END events |
 | `emit_tool_events` | `True` | Emit TOOL_START/END events |
 

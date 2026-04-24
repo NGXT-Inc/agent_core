@@ -17,7 +17,7 @@ import hashlib
 import logging
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Callable
 
 from google import genai
@@ -439,21 +439,39 @@ class ContextCacheRegistry:
         """
         names: list[str] = []
         if slot.pending is not None:
-            if slot.pending.done():
+            pending = slot.pending
+            if pending.done():
                 try:
-                    names.append(slot.pending.result(timeout=0))
+                    names.append(pending.result(timeout=0))
                 except Exception:
                     pass
             else:
-                slot.pending.cancel()
+                cancelled = pending.cancel()
                 if wait_for_pending:
                     try:
-                        names.append(slot.pending.result(timeout=5))
+                        names.append(pending.result(timeout=5))
+                    except FutureTimeoutError:
+                        if not pending.cancelled():
+                            self._delete_future_cache_when_done(pending)
                     except Exception:
                         pass
+                elif not cancelled:
+                    self._delete_future_cache_when_done(pending)
         if slot.ready_name:
             names.append(slot.ready_name)
         return names
+
+    def _delete_future_cache_when_done(self, future: Future) -> None:
+        """Delete a remote cache created by a future we no longer track."""
+        def _cleanup(done_future: Future) -> None:
+            try:
+                name = done_future.result(timeout=0)
+            except Exception:
+                return
+            if name:
+                self._delete_cache(name)
+
+        future.add_done_callback(_cleanup)
 
     @staticmethod
     def _clear_ready(slot: _CacheSlot) -> None:

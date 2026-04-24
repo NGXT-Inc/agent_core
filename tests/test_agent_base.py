@@ -1,6 +1,7 @@
 """Tests for the Agent base class (excluding caching, tested in test_caching.py)."""
 
 import os
+import time
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -421,6 +422,92 @@ class TestConversationHistory:
         assert deltas == ["Hel", "lo"]
         mock_client.models.generate_content.assert_not_called()
         assert len(agent._history) == 2
+        agent.close()
+
+    def test_run_streaming_true_without_callback_uses_stream_transport(self, mock_env, mock_genai):
+        """streaming=True should not require a text callback to take effect."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content_stream.return_value = iter([
+            make_text_response("streamed"),
+        ])
+
+        agent = Agent()
+        result = agent.run("hello", streaming=True)
+
+        assert result == "streamed"
+        mock_client.models.generate_content.assert_not_called()
+        mock_client.models.generate_content_stream.assert_called_once()
+        agent.close()
+
+    def test_agent_streaming_default_can_be_overridden_per_run(self, mock_env, mock_genai):
+        """Constructor default controls streaming unless run() overrides it."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_text_response("plain")
+
+        agent = Agent(streaming=True)
+        result = agent.run("hello", streaming=False)
+
+        assert result == "plain"
+        mock_client.models.generate_content.assert_called_once()
+        mock_client.models.generate_content_stream.assert_not_called()
+        agent.close()
+
+    def test_agent_streaming_default_applies_to_run(self, mock_env, mock_genai):
+        """Agent-level streaming default should apply when run() omits streaming."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content_stream.return_value = iter([
+            make_text_response("default stream"),
+        ])
+
+        agent = Agent(streaming=True)
+        result = agent.run("hello")
+
+        assert result == "default stream"
+        mock_client.models.generate_content.assert_not_called()
+        mock_client.models.generate_content_stream.assert_called_once()
+        agent.close()
+
+    def test_class_streaming_default_applies_to_run(self, mock_env, mock_genai):
+        """DEFAULT_STREAMING should configure streaming for subclasses."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content_stream.return_value = iter([
+            make_text_response("class stream"),
+        ])
+
+        class StreamingAgent(Agent):
+            DEFAULT_STREAMING = True
+
+        agent = StreamingAgent()
+        result = agent.run("hello")
+
+        assert result == "class stream"
+        mock_client.models.generate_content.assert_not_called()
+        mock_client.models.generate_content_stream.assert_called_once()
+        agent.close()
+
+    def test_agent_streaming_default_applies_to_run_stateless(self, mock_env, mock_genai):
+        """Agent-level streaming default should apply to stateless calls too."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content_stream.return_value = iter([
+            make_text_response("stateless stream"),
+        ])
+
+        agent = Agent(streaming=True)
+        result = agent.run_stateless("hello")
+
+        assert result == "stateless stream"
+        mock_client.models.generate_content.assert_not_called()
+        mock_client.models.generate_content_stream.assert_called_once()
         agent.close()
 
 
@@ -846,6 +933,37 @@ class TestCancellation:
         assert result_holder.get("result") == "[Cancelled]"
         agent.close()
 
+    def test_cancel_does_not_wait_for_noncooperative_tool(self, mock_env, mock_genai):
+        """Cancellation should return without waiting for a stuck running tool."""
+        from agent_core.agents.base import Agent
+        from agent_core.providers.types import ToolCall
+
+        agent = Agent()
+
+        def cancel_tool() -> str:
+            """Trigger cancellation."""
+            agent.cancel()
+            return "cancelled"
+
+        def stuck_tool() -> str:
+            """Ignore cancellation for a while."""
+            time.sleep(1.2)
+            return "late"
+
+        agent.register_tool(cancel_tool)
+        agent.register_tool(stuck_tool)
+
+        started = time.perf_counter()
+        results = agent._execute_tools_parallel([
+            ToolCall(id="call_1", name="cancel_tool", args={}),
+            ToolCall(id="call_2", name="stuck_tool", args={}),
+        ])
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 1.0
+        assert results[1] == ("stuck_tool", {"error": "Cancelled"})
+        agent.close()
+
     def test_cancel_works_with_run_stateless(self, mock_env, mock_genai):
         """cancel() should also work with run_stateless()."""
         from agent_core.agents.base import Agent
@@ -1078,6 +1196,30 @@ class TestEventEmission:
 
 class TestCompaction:
     """Test automatic context compaction in the shared runtime."""
+
+    def test_enabled_default_compaction_config_is_safe(self, mock_env, mock_genai):
+        """ENABLE_COMPACTION=True should not trigger zero-token summaries."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_text_response("ok")
+
+        class DefaultCompactingAgent(Agent):
+            ENABLE_COMPACTION = True
+
+        agent = DefaultCompactingAgent()
+        agent._history.extend([
+            agent._provider.build_user_message("u1"),
+            MockContent(role="model", parts=[MockPart(text="m1")]),
+            agent._provider.build_user_message("u2"),
+            MockContent(role="model", parts=[MockPart(text="m2")]),
+        ])
+
+        result = agent.run("latest")
+
+        assert result == "ok"
+        assert mock_client.models.generate_content.call_count == 1
+        agent.close()
 
     def test_run_compacts_history_before_model_call(self, mock_env, mock_genai):
         """run() should compact old history when the context threshold is exceeded."""
