@@ -40,7 +40,18 @@ from agent_core.agents.compaction import (
 from agent_core.core.caching import ContextCacheRegistry
 from agent_core.core.events import EventBus, EventType, EventStatus, Event, get_event_bus, emit_event
 from agent_core.core.persistence import ConversationStoreProtocol
-from agent_core.providers.types import LLMProvider, ParsedResponse, TokenUsage, ToolCall
+from agent_core.providers.types import (
+    AgentResponse,
+    FilePart,
+    LLMProvider,
+    TextPart,
+    TextOutputPart,
+    TokenUsage,
+    ToolCall,
+    UserMessage,
+    UserMessageInput,
+    coerce_user_message,
+)
 
 # Default model constants (can be overridden at class level)
 MODEL_PRO = "gemini-3.1-pro-preview"
@@ -305,6 +316,7 @@ class Agent:
         else:
             self._history: list[Any] = []
         self._compaction_count = 0
+        self._last_response: AgentResponse | None = None
 
         # Parent agent instance ID for event tracking (graph edges)
         self._parent_agent: str | None = parent_agent
@@ -1379,7 +1391,15 @@ class Agent:
                     contents.append(parsed.raw_message)
                 if save_history:
                     self._save_history()
-                return parsed.text or "", _usage_dict()
+                usage = _usage_dict()
+                parts = tuple(parsed.output_parts)
+                if not parts:
+                    parts = (TextOutputPart(parsed.text or ""),)
+                self._last_response = AgentResponse(
+                    parts=parts,
+                    token_usage=usage,
+                )
+                return self._last_response.text, usage
 
             # Append the model's tool-calling message
             if parsed.raw_message is not None:
@@ -1481,6 +1501,7 @@ class Agent:
             self._cancel_event.clear()
 
         self._compaction_count = 0
+        self._last_response = None
         self.on_agent_start(prompt)
 
         if self.emit_lifecycle_events:
@@ -1529,17 +1550,18 @@ class Agent:
 
     def run(
         self,
-        prompt: str,
+        prompt: UserMessageInput,
         temperature: float = 0.7,
         max_output_tokens: int = 32768,
         wait_for_cache: bool = False,
         streaming: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        attachments: list[FilePart] | tuple[FilePart, ...] | None = None,
     ) -> str:
         """Run the agent with a prompt (maintains conversation history).
 
         Args:
-            prompt: User prompt or task description.
+            prompt: User prompt, task description, or provider-neutral message.
             temperature: Sampling temperature.
             max_output_tokens: Maximum tokens in response.
             wait_for_cache: If True, block until any pending cache creation
@@ -1548,14 +1570,19 @@ class Agent:
             streaming: If True, use provider streaming when available. If
                 None, uses this agent's configured streaming default.
             on_text_delta: Callback invoked with incremental text chunks.
+            attachments: Optional ephemeral file attachments to include with
+                this user message. Persistent stores retain placeholders only.
 
         Returns:
             The agent's final text response.
         """
 
+        user_message = coerce_user_message(prompt, attachments)
+        prompt_text = user_message.text
+
         def _execute() -> tuple[str, dict]:
             use_streaming = self.streaming if streaming is None else streaming
-            self._history.append(self._provider.build_user_message(prompt))
+            self._history.append(self._provider.build_user_message(user_message))
             self._save_history()
 
             cache_config = self._build_cache_config(wait_for_cache=wait_for_cache)
@@ -1590,40 +1617,72 @@ class Agent:
 
             return result, token_usage
 
-        return self._execute_run(prompt, _execute)
+        return self._execute_run(prompt_text, _execute)
+
+    def run_response(
+        self,
+        prompt: UserMessageInput,
+        temperature: float = 0.7,
+        max_output_tokens: int = 32768,
+        wait_for_cache: bool = False,
+        streaming: bool | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
+        attachments: list[FilePart] | tuple[FilePart, ...] | None = None,
+    ) -> AgentResponse:
+        """Run the agent and return structured response parts."""
+        text = self.run(
+            prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            wait_for_cache=wait_for_cache,
+            streaming=streaming,
+            on_text_delta=on_text_delta,
+            attachments=attachments,
+        )
+        return self._last_response or AgentResponse.from_text(text)
 
     def run_stateless(
         self,
-        prompt: str,
+        prompt: UserMessageInput,
         context: dict[str, Any] | None = None,
         temperature: float = 0.7,
         max_output_tokens: int = 32768,
         streaming: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        attachments: list[FilePart] | tuple[FilePart, ...] | None = None,
     ) -> str:
         """Run the agent without maintaining conversation history.
 
         Useful for one-shot tasks where each call is independent.
 
         Args:
-            prompt: User prompt or task description.
+            prompt: User prompt, task description, or provider-neutral message.
             context: Optional context dict to include in the prompt.
             temperature: Sampling temperature.
             max_output_tokens: Maximum tokens in response.
             streaming: If True, use provider streaming when available. If
                 None, uses this agent's configured streaming default.
             on_text_delta: Callback invoked with incremental text chunks.
+            attachments: Optional ephemeral file attachments to include with
+                this user message. Persistent stores retain placeholders only.
 
         Returns:
             The agent's final text response.
         """
-        full_prompt = prompt
+        user_message = coerce_user_message(prompt, attachments)
         if context:
             context_str = "\n".join(f"{k}: {v}" for k, v in context.items())
-            full_prompt = f"Context:\n{context_str}\n\nTask: {prompt}"
+            context_prefix = f"Context:\n{context_str}\n\nTask:"
+            parts = list(user_message.parts)
+            if parts and isinstance(parts[0], TextPart):
+                parts[0] = TextPart(f"{context_prefix} {parts[0].text}")
+            else:
+                parts.insert(0, TextPart(context_prefix))
+            user_message = UserMessage(parts)
+        full_prompt = user_message.text
 
         def _execute() -> tuple[str, dict]:
-            contents = [self._provider.build_user_message(full_prompt)]
+            contents = [self._provider.build_user_message(user_message)]
             use_streaming = self.streaming if streaming is None else streaming
             return self._run_with_function_loop(
                 contents,
@@ -1635,6 +1694,28 @@ class Agent:
             )
 
         return self._execute_run(full_prompt, _execute)
+
+    def run_stateless_response(
+        self,
+        prompt: UserMessageInput,
+        context: dict[str, Any] | None = None,
+        temperature: float = 0.7,
+        max_output_tokens: int = 32768,
+        streaming: bool | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
+        attachments: list[FilePart] | tuple[FilePart, ...] | None = None,
+    ) -> AgentResponse:
+        """Run statelessly and return structured response parts."""
+        text = self.run_stateless(
+            prompt,
+            context=context,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            streaming=streaming,
+            on_text_delta=on_text_delta,
+            attachments=attachments,
+        )
+        return self._last_response or AgentResponse.from_text(text)
 
 
 def agent_as_tool(agent: Agent, description: str | None = None) -> Callable:

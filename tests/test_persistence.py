@@ -31,12 +31,27 @@ class MockFunctionResponse:
         self.response = response
 
 
+class MockFileData:
+    def __init__(self, file_uri, mime_type):
+        self.file_uri = file_uri
+        self.mime_type = mime_type
+
+
 class MockPart:
-    def __init__(self, text=None, function_call=None, function_response=None, inline_data=None, thought=None):
+    def __init__(
+        self,
+        text=None,
+        function_call=None,
+        function_response=None,
+        inline_data=None,
+        file_data=None,
+        thought=None,
+    ):
         self.text = text
         self.function_call = function_call
         self.function_response = function_response
         self.inline_data = inline_data
+        self.file_data = file_data
         self.thought = thought
 
 
@@ -222,6 +237,30 @@ class TestSQLiteConversationStore:
 
         assert loaded == history
 
+    def test_openai_multimodal_messages_persist_ephemeral_placeholders(self, temp_db):
+        """Provider-backed SQLite storage should not persist inline file bytes."""
+        from agent_core.providers.openai import OpenAIProvider
+        from agent_core.providers.types import FilePart, UserMessage
+
+        provider = OpenAIProvider(client=MagicMock())
+        store = SQLiteConversationStore(temp_db, provider=provider)
+        history = [
+            provider.build_user_message(
+                UserMessage.from_prompt(
+                    "Describe",
+                    [FilePart.from_bytes(b"img", mime_type="image/png")],
+                )
+            )
+        ]
+
+        store.save("s-openai-files", "agent", history)
+        loaded = store.load("s-openai-files", "agent")
+
+        assert loaded[0]["content"][2]["text"] == (
+            "[Attached file omitted after reload: image attachment (image/png)]"
+        )
+        assert "aW1n" not in json.dumps(loaded)
+
 
 class TestSerialization:
     """Test Content serialization/deserialization helpers."""
@@ -252,8 +291,31 @@ class TestSerialization:
         inline.mime_type = "image/png"
         content = MockContent(role="user", parts=[MockPart(inline_data=inline)])
         result = serialize_content(content)
-        assert result["parts"][0]["type"] == "inline_data"
-        assert result["parts"][0]["skipped"] is True
+        assert result["parts"][0]["type"] == "ephemeral_file"
+        assert result["parts"][0]["placeholder"] == (
+            "[Attached file omitted after reload: unnamed attachment (image/png)]"
+        )
+
+    def test_deserialize_ephemeral_file_as_text_placeholder(self):
+        data = {
+            "role": "user",
+            "parts": [
+                {
+                    "type": "ephemeral_file",
+                    "mime_type": "application/pdf",
+                    "placeholder": (
+                        "[Attached file omitted after reload: paper.pdf "
+                        "(application/pdf)]"
+                    ),
+                }
+            ],
+        }
+
+        restored = deserialize_content(data)
+
+        assert restored.parts[0].text == (
+            "[Attached file omitted after reload: paper.pdf (application/pdf)]"
+        )
 
     def test_roundtrip_text(self):
         """Serialize then deserialize text content."""

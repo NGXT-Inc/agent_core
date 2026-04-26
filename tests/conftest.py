@@ -28,6 +28,22 @@ class MockFunctionResponse:
         self.response = response
 
 
+class MockFileData:
+    """Mock for google.genai file data parts."""
+
+    def __init__(self, file_uri: str, mime_type: str):
+        self.file_uri = file_uri
+        self.mime_type = mime_type
+
+
+class MockInlineData:
+    """Mock for google.genai inline data parts."""
+
+    def __init__(self, data: bytes, mime_type: str):
+        self.data = data
+        self.mime_type = mime_type
+
+
 class MockPart:
     """Mock for google.genai.types.Part."""
 
@@ -38,12 +54,14 @@ class MockPart:
         function_response: MockFunctionResponse = None,
         thought: str = None,
         inline_data: Any = None,
+        file_data: Any = None,
     ):
         self.text = text
         self.function_call = function_call
         self.function_response = function_response
         self.thought = thought
         self.inline_data = inline_data
+        self.file_data = file_data
 
     @classmethod
     def from_text(cls, text: str):
@@ -56,6 +74,14 @@ class MockPart:
     @classmethod
     def from_function_response(cls, name: str, response: dict):
         return cls(function_response=MockFunctionResponse(name, response))
+
+    @classmethod
+    def from_bytes(cls, data: bytes, mime_type: str):
+        return cls(inline_data=MockInlineData(data, mime_type))
+
+    @classmethod
+    def from_uri(cls, file_uri: str, mime_type: str):
+        return cls(file_data=MockFileData(file_uri, mime_type))
 
 
 class MockContent:

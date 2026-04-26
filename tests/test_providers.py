@@ -1,14 +1,112 @@
 """Tests for provider implementations."""
 
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent_core.providers.types import LLMProvider, ParsedResponse, TokenUsage, ToolCall
-from tests.conftest import make_text_response
+from agent_core.providers.types import (
+    AgentResponse,
+    FilePart,
+    FileOutputPart,
+    LLMProvider,
+    TextOutputPart,
+    ParsedResponse,
+    TextPart,
+    TokenUsage,
+    ToolCall,
+    UnsupportedInputPart,
+    UserMessage,
+    coerce_user_message,
+)
+from tests.conftest import (
+    MockContent,
+    MockInlineData,
+    MockPart,
+    MockResponse,
+    make_text_response,
+)
+
+
+# ============================================================
+# Provider-neutral message part tests
+# ============================================================
+
+
+class TestMessageParts:
+    """Test provider-neutral message and attachment helpers."""
+
+    def test_file_part_from_bytes_data_url(self):
+        part = FilePart.from_bytes(
+            b"hello",
+            mime_type="text/plain",
+            filename="note.txt",
+        )
+
+        assert part.to_base64() == "aGVsbG8="
+        assert part.to_data_url() == "data:text/plain;base64,aGVsbG8="
+        assert part.placeholder() == (
+            "[Attached file omitted after reload: note.txt (text/plain)]"
+        )
+
+    def test_file_part_from_path_guesses_mime_type(self, tmp_path: Path):
+        file_path = tmp_path / "image.png"
+        file_path.write_bytes(b"png")
+
+        part = FilePart.from_path(file_path)
+
+        assert part.data == b"png"
+        assert part.filename == "image.png"
+        assert part.mime_type == "image/png"
+        assert part.is_image is True
+
+    def test_file_part_requires_single_source(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            FilePart(data=b"x", uri="gs://bucket/file.txt")
+
+    def test_coerce_user_message_adds_attachments(self):
+        attachment = FilePart.from_bytes(
+            b"data",
+            mime_type="application/pdf",
+            filename="paper.pdf",
+        )
+
+        message = coerce_user_message("Summarize", [attachment])
+
+        assert message.parts == (TextPart("Summarize"), attachment)
+        assert message.text == (
+            "Summarize\n"
+            "[Attached file omitted after reload: paper.pdf (application/pdf)]"
+        )
+
+    def test_coerce_user_message_extends_existing_message(self):
+        attachment = FilePart.from_uri(
+            "gs://bucket/image.jpg",
+            mime_type="image/jpeg",
+            filename="image.jpg",
+        )
+        base = UserMessage.from_text("Look at this")
+
+        message = coerce_user_message(base, [attachment])
+
+        assert message.parts == (TextPart("Look at this"), attachment)
+
+    def test_agent_response_text_view(self):
+        response = AgentResponse(
+            parts=(
+                TextOutputPart("hello"),
+                FileOutputPart.from_data_url("data:image/png;base64,aW1n"),
+            )
+        )
+
+        assert response.text == "hello"
+        assert str(response) == "hello"
+        assert response.parts[1].data == b"img"
+        assert response.parts[1].mime_type == "image/png"
 
 
 # ============================================================
@@ -121,6 +219,7 @@ class TestOpenAIProvider:
         completion_tokens=50,
         cached_tokens=0,
         cache_write_tokens=0,
+        images=None,
     ):
         """Build a mock OpenAI response."""
         msg = MagicMock()
@@ -128,6 +227,7 @@ class TestOpenAIProvider:
         msg.content = content
         msg.tool_calls = tool_calls
         msg.reasoning_details = reasoning_details
+        msg.images = images
 
         usage = MagicMock()
         usage.prompt_tokens = prompt_tokens
@@ -385,10 +485,170 @@ class TestOpenAIProvider:
         parsed = provider.parse_response(response)
         assert parsed.thinking_text is None
 
+    def test_parse_image_output_parts(self):
+        provider, _ = self._make_provider()
+        response = self._make_mock_response(
+            content="Here is the image.",
+            images=[
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,aW1n",
+                    },
+                }
+            ],
+        )
+
+        parsed = provider.parse_response(response)
+
+        assert parsed.text == "Here is the image."
+        assert parsed.output_parts[0].text == "Here is the image."
+        assert parsed.output_parts[1].data == b"img"
+        assert parsed.output_parts[1].mime_type == "image/png"
+
+    def test_parse_image_output_adds_ephemeral_placeholder_to_history(self):
+        provider, _ = self._make_provider()
+        response = self._make_mock_response(
+            content="Here is the image.",
+            images=[
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,aW1n",
+                    },
+                }
+            ],
+        )
+
+        parsed = provider.parse_response(response)
+        serialized = provider.serialize_message(parsed.raw_message)
+
+        assert parsed.raw_message["content"] == (
+            "Here is the image.\n"
+            "[Attached file omitted after reload: image attachment (image/png)]"
+        )
+        assert serialized["content"] == parsed.raw_message["content"]
+        assert "aW1n" not in json.dumps(serialized)
+
     def test_build_user_message(self):
         provider, _ = self._make_provider()
         msg = provider.build_user_message("hello")
         assert msg == {"role": "user", "content": "hello"}
+
+    def test_build_user_message_with_inline_image(self):
+        provider, _ = self._make_provider()
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Describe this",
+                [
+                    FilePart.from_bytes(
+                        b"img",
+                        mime_type="image/png",
+                        filename="plot.png",
+                        detail="low",
+                    )
+                ],
+            )
+        )
+
+        assert msg["role"] == "user"
+        assert msg["content"][0] == {"type": "text", "text": "Describe this"}
+        assert msg["content"][1] == {
+            "type": "text",
+            "text": "[Attached file: plot.png (image/png)]",
+        }
+        assert msg["content"][2] == {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64,aW1n",
+                "detail": "low",
+            },
+        }
+
+    def test_build_user_message_with_inline_pdf(self):
+        provider, _ = self._make_provider()
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Summarize this",
+                [
+                    FilePart.from_bytes(
+                        b"pdf",
+                        mime_type="application/pdf",
+                        filename="paper.pdf",
+                    )
+                ],
+            )
+        )
+
+        assert msg["content"][2] == {
+            "type": "file",
+            "file": {
+                "filename": "paper.pdf",
+                "file_data": "cGRm",
+            },
+        }
+
+    def test_build_user_message_with_file_id(self):
+        provider, _ = self._make_provider()
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Summarize this",
+                [
+                    FilePart.from_file_id(
+                        "file_123",
+                        mime_type="application/pdf",
+                        filename="paper.pdf",
+                    )
+                ],
+            )
+        )
+
+        assert msg["content"][2] == {
+            "type": "file",
+            "file": {
+                "filename": "paper.pdf",
+                "file_id": "file_123",
+            },
+        }
+
+    def test_build_user_message_rejects_non_image_uri(self):
+        provider, _ = self._make_provider()
+
+        with pytest.raises(UnsupportedInputPart, match="file URI"):
+            provider.build_user_message(
+                UserMessage.from_prompt(
+                    "Summarize this",
+                    [
+                        FilePart.from_uri(
+                            "https://example.com/paper.pdf",
+                            mime_type="application/pdf",
+                            filename="paper.pdf",
+                        )
+                    ],
+                )
+            )
+
+    def test_serialize_multimodal_message_replaces_file_with_placeholder(self):
+        provider, _ = self._make_provider()
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Describe this",
+                [FilePart.from_bytes(b"img", mime_type="image/png")],
+            )
+        )
+
+        serialized = provider.serialize_message(msg)
+        display = provider.format_message_for_display(serialized)
+
+        assert serialized["content"][2] == {
+            "type": "text",
+            "text": (
+                "[Attached file omitted after reload: image attachment "
+                "(image/png)]"
+            ),
+        }
+        assert "aW1n" not in json.dumps(serialized)
+        assert "omitted after reload" in display["content"]
 
     def test_build_tool_result_messages(self):
         provider, _ = self._make_provider()
@@ -699,6 +959,73 @@ class TestOpenRouterProvider:
         assert call_kwargs["extra_headers"]["X-OpenRouter-Cache-TTL"] == "300"
         assert call_kwargs["extra_body"]["cache_control"] == {"type": "ephemeral"}
 
+    def test_build_user_message_accepts_pdf_url(self):
+        from agent_core.providers.openrouter import OpenRouterProvider
+
+        mock_client = MagicMock()
+        provider = OpenRouterProvider(client=mock_client)
+
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Summarize this",
+                [
+                    FilePart.from_uri(
+                        "https://example.com/paper.pdf",
+                        mime_type="application/pdf",
+                        filename="paper.pdf",
+                    )
+                ],
+            )
+        )
+
+        assert msg["content"][2] == {
+            "type": "file",
+            "file": {
+                "filename": "paper.pdf",
+                "file_data": "https://example.com/paper.pdf",
+            },
+        }
+
+    def test_build_user_message_uses_data_url_for_inline_pdf(self):
+        from agent_core.providers.openrouter import OpenRouterProvider
+
+        mock_client = MagicMock()
+        provider = OpenRouterProvider(client=mock_client)
+
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Summarize this",
+                [
+                    FilePart.from_bytes(
+                        b"pdf",
+                        mime_type="application/pdf",
+                        filename="paper.pdf",
+                    )
+                ],
+            )
+        )
+
+        assert msg["content"][2]["file"]["file_data"] == (
+            "data:application/pdf;base64,cGRm"
+        )
+
+    def test_provider_accepts_underscored_env_alias(self):
+        from agent_core.providers.openrouter import OpenRouterProvider
+
+        with patch.dict(
+            os.environ,
+            {
+                "OPENROUTER_API_KEY": "",
+                "OPEN_ROUTER_API_KEY": "alias-key",
+            },
+            clear=False,
+        ):
+            with patch("agent_core.providers.openrouter.load_dotenv"):
+                with patch("openai.OpenAI") as mock_openai:
+                    OpenRouterProvider()
+
+        assert mock_openai.call_args.kwargs["api_key"] == "alias-key"
+
 
 # ============================================================
 # GeminiProvider tests
@@ -732,6 +1059,34 @@ class TestGeminiProvider:
         parsed = provider.parse_response(response)
         assert parsed.text == "Hello"
         assert parsed.tool_calls == []
+
+    def test_parse_rich_response_preserves_output_part_order(self):
+        from unittest.mock import patch
+        from agent_core.providers.gemini import GeminiProvider
+
+        mock_client = MagicMock()
+        with patch("agent_core.providers.gemini.genai"):
+            provider = GeminiProvider(client=mock_client)
+
+        content = MockContent(
+            role="model",
+            parts=[
+                MockPart(text="Before"),
+                MockPart(inline_data=MockInlineData(b"img", "image/png")),
+                MockPart(text="After"),
+            ],
+        )
+        response = MockResponse(text="Before\nAfter", content=content)
+
+        parsed = provider.parse_response(response)
+
+        assert parsed.text == "Before\nAfter"
+        assert isinstance(parsed.output_parts[0], TextOutputPart)
+        assert parsed.output_parts[0].text == "Before"
+        assert isinstance(parsed.output_parts[1], FileOutputPart)
+        assert parsed.output_parts[1].data == b"img"
+        assert isinstance(parsed.output_parts[2], TextOutputPart)
+        assert parsed.output_parts[2].text == "After"
 
     def test_parse_tool_call_response(self):
         from unittest.mock import patch
@@ -782,6 +1137,68 @@ class TestGeminiProvider:
                 provider.build_user_message("hello")
                 mock_types.Content.assert_called_once()
 
+    def test_build_user_message_with_inline_file(self, mock_genai):
+        from agent_core.providers.gemini import GeminiProvider
+
+        mock_client = mock_genai.Client.return_value
+        provider = GeminiProvider(client=mock_client)
+
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Describe this",
+                [
+                    FilePart.from_bytes(
+                        b"image",
+                        mime_type="image/png",
+                        filename="plot.png",
+                    )
+                ],
+            )
+        )
+
+        assert msg.parts[0].text == "Describe this"
+        assert msg.parts[1].text == "[Attached file: plot.png (image/png)]"
+        assert msg.parts[2].inline_data.data == b"image"
+        assert msg.parts[2].inline_data.mime_type == "image/png"
+
+    def test_build_user_message_with_uri_file(self, mock_genai):
+        from agent_core.providers.gemini import GeminiProvider
+
+        mock_client = mock_genai.Client.return_value
+        provider = GeminiProvider(client=mock_client)
+
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Read this",
+                [
+                    FilePart.from_uri(
+                        "gs://bucket/paper.pdf",
+                        mime_type="application/pdf",
+                        filename="paper.pdf",
+                    )
+                ],
+            )
+        )
+
+        assert msg.parts[1].text == "[Attached file: paper.pdf (application/pdf)]"
+        assert msg.parts[2].file_data.file_uri == "gs://bucket/paper.pdf"
+        assert msg.parts[2].file_data.mime_type == "application/pdf"
+
+    def test_build_user_message_rejects_provider_file_id(self, mock_genai):
+        from agent_core.providers.gemini import GeminiProvider
+        from agent_core.providers.types import UnsupportedInputPart
+
+        mock_client = mock_genai.Client.return_value
+        provider = GeminiProvider(client=mock_client)
+
+        with pytest.raises(UnsupportedInputPart, match="file IDs"):
+            provider.build_user_message(
+                UserMessage.from_prompt(
+                    "Read this",
+                    [FilePart.from_file_id("file_123", filename="paper.pdf")],
+                )
+            )
+
     def test_build_tool_result_messages_preserves_regular_files_list(self, mock_genai):
         from agent_core.providers.gemini import GeminiProvider
 
@@ -809,6 +1226,55 @@ class TestGeminiProvider:
 
         response = msg.parts[0].function_response.response
         assert response == {"result": [{"title": "A"}, {"title": "B"}]}
+
+    def test_build_tool_result_messages_attaches_file_parts(self, mock_genai):
+        from agent_core.providers.gemini import GeminiProvider
+
+        mock_client = mock_genai.Client.return_value
+        provider = GeminiProvider(client=mock_client)
+
+        msg = provider.build_tool_result_messages(
+            [ToolCall(id="call_1", name="make_plot", args={})],
+            [
+                (
+                    "make_plot",
+                    {
+                        "summary": "created",
+                        "images": [
+                            {
+                                "data": b"png",
+                                "mime_type": "image/png",
+                                "filename": "plot.png",
+                            }
+                        ],
+                    },
+                )
+            ],
+        )
+
+        assert msg.parts[0].function_response.response == {"summary": "created"}
+        assert msg.parts[1].text == "[Attached file: plot.png (image/png)]"
+        assert msg.parts[2].inline_data.data == b"png"
+
+    def test_gemini_serializes_inline_file_as_ephemeral_placeholder(self, mock_genai):
+        from agent_core.providers.gemini import GeminiProvider
+
+        mock_client = mock_genai.Client.return_value
+        provider = GeminiProvider(client=mock_client)
+        msg = provider.build_user_message(
+            UserMessage.from_prompt(
+                "Describe",
+                [FilePart.from_bytes(b"png", mime_type="image/png")],
+            )
+        )
+
+        serialized = provider.serialize_message(msg)
+        restored = provider.deserialize_message(serialized)
+
+        assert serialized["parts"][2]["type"] == "ephemeral_file"
+        assert restored.parts[2].text == (
+            "[Attached file omitted after reload: unnamed attachment (image/png)]"
+        )
 
     def test_generate_stream_aggregates_text_chunks(self, mock_genai):
         from agent_core.providers.gemini import GeminiProvider

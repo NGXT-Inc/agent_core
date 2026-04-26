@@ -5,17 +5,39 @@ agents to work with different LLM backends (Gemini, OpenAI, etc.).
 """
 
 from agent_core.providers.types import (
+    AgentResponse,
+    FilePart,
+    FileOutputPart,
     LLMProvider,
+    MessagePart,
+    OutputPart,
     ParsedResponse,
+    TextPart,
+    TextOutputPart,
     TokenUsage,
     ToolCall,
+    UnsupportedInputPart,
+    UserMessage,
+    UserMessageInput,
+    coerce_user_message,
 )
 
 __all__ = [
     "LLMProvider",
+    "AgentResponse",
+    "FilePart",
+    "FileOutputPart",
+    "MessagePart",
+    "OutputPart",
     "ParsedResponse",
+    "TextPart",
+    "TextOutputPart",
     "TokenUsage",
     "ToolCall",
+    "UnsupportedInputPart",
+    "UserMessage",
+    "UserMessageInput",
+    "coerce_user_message",
 ]
 
 try:

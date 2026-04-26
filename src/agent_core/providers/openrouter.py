@@ -12,6 +12,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from dotenv import find_dotenv, load_dotenv
+
 from agent_core.providers.openai import OpenAIProvider
 
 
@@ -83,7 +85,12 @@ class OpenRouterProvider(OpenAIProvider):
         prompt_cache_control: dict[str, Any] | None = None,
     ) -> None:
         if client is None:
-            api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+            load_dotenv(find_dotenv(usecwd=True))
+            api_key = (
+                api_key
+                or os.environ.get("OPENROUTER_API_KEY")
+                or os.environ.get("OPEN_ROUTER_API_KEY")
+            )
             if not api_key:
                 raise ValueError(
                     "OPENROUTER_API_KEY must be set in environment or passed as api_key"
@@ -123,4 +130,6 @@ class OpenRouterProvider(OpenAIProvider):
             extra_body=extra_body,
             extra_headers=headers,
             cache_config=cache_defaults or None,
+            allow_file_urls=True,
+            file_data_format="data_url",
         )

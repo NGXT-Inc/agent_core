@@ -10,8 +10,283 @@ inspects during execution.
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from pathlib import Path
+from typing import Any, Callable, Protocol, TypeAlias, runtime_checkable
+
+from agent_core.core.attachments import format_attachment_placeholder
+
+
+class UnsupportedInputPart(ValueError):
+    """Raised when a provider cannot encode a user message part."""
+
+
+@dataclass(frozen=True, slots=True)
+class TextPart:
+    """A text segment inside a provider-neutral user message."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class FilePart:
+    """A provider-neutral file attachment.
+
+    Attachments are ephemeral by default. Live provider messages may contain
+    bytes, URLs, or provider file IDs, but persistence should retain only a
+    text placeholder unless an application supplies its own durable attachment
+    store.
+    """
+
+    data: bytes | None = field(default=None, repr=False)
+    uri: str | None = None
+    file_id: str | None = None
+    mime_type: str = "application/octet-stream"
+    filename: str | None = None
+    description: str | None = None
+    detail: str | None = None
+
+    def __post_init__(self) -> None:
+        sources = [
+            self.data is not None,
+            self.uri is not None,
+            self.file_id is not None,
+        ]
+        if sum(sources) != 1:
+            raise ValueError(
+                "FilePart requires exactly one of data, uri, or file_id"
+            )
+        if not self.mime_type:
+            object.__setattr__(self, "mime_type", "application/octet-stream")
+
+    @classmethod
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        mime_type: str | None = None,
+        filename: str | None = None,
+        description: str | None = None,
+        detail: str | None = None,
+    ) -> "FilePart":
+        """Create an inline attachment from a local file path."""
+        file_path = Path(path)
+        guessed_type, _encoding = mimetypes.guess_type(file_path.name)
+        return cls(
+            data=file_path.read_bytes(),
+            mime_type=mime_type or guessed_type or "application/octet-stream",
+            filename=filename or file_path.name,
+            description=description,
+            detail=detail,
+        )
+
+    @classmethod
+    def from_bytes(
+        cls,
+        data: bytes,
+        *,
+        mime_type: str,
+        filename: str | None = None,
+        description: str | None = None,
+        detail: str | None = None,
+    ) -> "FilePart":
+        return cls(
+            data=data,
+            mime_type=mime_type,
+            filename=filename,
+            description=description,
+            detail=detail,
+        )
+
+    @classmethod
+    def from_uri(
+        cls,
+        uri: str,
+        *,
+        mime_type: str,
+        filename: str | None = None,
+        description: str | None = None,
+        detail: str | None = None,
+    ) -> "FilePart":
+        return cls(
+            uri=uri,
+            mime_type=mime_type,
+            filename=filename,
+            description=description,
+            detail=detail,
+        )
+
+    @classmethod
+    def from_file_id(
+        cls,
+        file_id: str,
+        *,
+        mime_type: str = "application/octet-stream",
+        filename: str | None = None,
+        description: str | None = None,
+        detail: str | None = None,
+    ) -> "FilePart":
+        return cls(
+            file_id=file_id,
+            mime_type=mime_type,
+            filename=filename,
+            description=description,
+            detail=detail,
+        )
+
+    @property
+    def is_image(self) -> bool:
+        return self.mime_type.startswith("image/")
+
+    def to_data_url(self) -> str:
+        """Return inline bytes as a data URL for OpenAI-compatible providers."""
+        if self.data is None:
+            raise ValueError("Only inline FilePart data can be encoded as a data URL")
+        encoded = base64.b64encode(self.data).decode("ascii")
+        return f"data:{self.mime_type};base64,{encoded}"
+
+    def to_base64(self) -> str:
+        """Return inline bytes as plain base64."""
+        if self.data is None:
+            raise ValueError("Only inline FilePart data can be base64 encoded")
+        return base64.b64encode(self.data).decode("ascii")
+
+    def placeholder(self) -> str:
+        """Describe an ephemeral attachment for persisted/reloaded history."""
+        label = self.filename or self.description or "unnamed attachment"
+        return format_attachment_placeholder(mime_type=self.mime_type, label=label)
+
+    def live_label(self) -> str:
+        """Describe an attachment to the live model before the binary/URI part."""
+        label = self.filename or self.description or "unnamed attachment"
+        return f"[Attached file: {label} ({self.mime_type})]"
+
+
+MessagePart: TypeAlias = TextPart | FilePart
+
+
+@dataclass(frozen=True, slots=True)
+class TextOutputPart:
+    """A text segment returned by a model."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class FileOutputPart:
+    """A file-like output returned by a model."""
+
+    data: bytes | None = field(default=None, repr=False)
+    uri: str | None = None
+    mime_type: str = "application/octet-stream"
+    filename: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.data is None) == (self.uri is None):
+            raise ValueError("FileOutputPart requires exactly one of data or uri")
+        if not self.mime_type:
+            object.__setattr__(self, "mime_type", "application/octet-stream")
+
+    @classmethod
+    def from_data_url(
+        cls,
+        data_url: str,
+        *,
+        filename: str | None = None,
+    ) -> "FileOutputPart":
+        if not data_url.startswith("data:") or "," not in data_url:
+            raise ValueError("Expected a data URL")
+        header, encoded = data_url.split(",", 1)
+        mime_type = header[5:].split(";", 1)[0] or "application/octet-stream"
+        return cls(
+            data=base64.b64decode(encoded),
+            mime_type=mime_type,
+            filename=filename,
+        )
+
+
+OutputPart: TypeAlias = TextOutputPart | FileOutputPart
+
+
+@dataclass(frozen=True, slots=True)
+class AgentResponse:
+    """Structured agent response with a text convenience view."""
+
+    parts: tuple[OutputPart, ...]
+    token_usage: dict | None = None
+
+    @classmethod
+    def from_text(
+        cls,
+        text: str,
+        *,
+        token_usage: dict | None = None,
+    ) -> "AgentResponse":
+        return cls(parts=(TextOutputPart(text),), token_usage=token_usage)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(
+            part.text for part in self.parts if isinstance(part, TextOutputPart)
+        )
+
+    def __str__(self) -> str:
+        return self.text
+
+
+@dataclass(frozen=True, slots=True)
+class UserMessage:
+    """Provider-neutral user message made of text and attachment parts."""
+
+    parts: tuple[MessagePart, ...]
+
+    def __init__(self, parts: list[MessagePart] | tuple[MessagePart, ...]):
+        if not parts:
+            raise ValueError("UserMessage requires at least one part")
+        object.__setattr__(self, "parts", tuple(parts))
+
+    @classmethod
+    def from_text(cls, text: str) -> "UserMessage":
+        return cls([TextPart(text)])
+
+    @classmethod
+    def from_prompt(
+        cls,
+        prompt: str,
+        attachments: list[FilePart] | tuple[FilePart, ...] | None = None,
+    ) -> "UserMessage":
+        parts: list[MessagePart] = [TextPart(prompt)]
+        if attachments:
+            parts.extend(attachments)
+        return cls(parts)
+
+    @property
+    def text(self) -> str:
+        """Text-only view used for hooks, events, and display."""
+        chunks: list[str] = []
+        for part in self.parts:
+            if isinstance(part, TextPart):
+                chunks.append(part.text)
+            elif isinstance(part, FilePart):
+                chunks.append(part.placeholder())
+        return "\n".join(chunk for chunk in chunks if chunk)
+
+
+UserMessageInput: TypeAlias = str | UserMessage
+
+
+def coerce_user_message(
+    message: UserMessageInput,
+    attachments: list[FilePart] | tuple[FilePart, ...] | None = None,
+) -> UserMessage:
+    """Normalize public user-message inputs to ``UserMessage``."""
+    if isinstance(message, UserMessage):
+        if attachments:
+            return UserMessage([*message.parts, *attachments])
+        return message
+    return UserMessage.from_prompt(message, attachments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +327,7 @@ class ParsedResponse:
     usage: TokenUsage = field(default_factory=TokenUsage)
     thinking_text: str | None = None
     streamed_text: bool = False
+    output_parts: list[OutputPart] = field(default_factory=list)
 
 
 @runtime_checkable
@@ -123,7 +399,7 @@ class LLMProvider(Protocol):
 
     # --- Message construction ---
 
-    def build_user_message(self, text: str) -> Any:
+    def build_user_message(self, message: UserMessageInput) -> Any:
         """Create a user message in provider-specific format."""
         ...
 

@@ -91,6 +91,38 @@ Streaming is transport-agnostic: applications decide whether deltas go to SSE,
 websockets, a terminal, or nowhere. The final response is still returned from
 `run()` and persisted through the configured conversation store.
 
+### File Attachments And Rich Responses
+
+Attach files to user messages with provider-neutral `FilePart` objects:
+
+```python
+from agent_core import FilePart
+
+response = agent.run(
+    "Summarize this document",
+    attachments=[
+        FilePart.from_path("paper.pdf", mime_type="application/pdf"),
+    ],
+)
+```
+
+`run()` still returns the final text for backward compatibility. Use
+`run_response()` when a provider may return richer output, such as generated
+images:
+
+```python
+response = agent.run_response("Generate a diagram of the workflow")
+print(response.text)
+for part in response.parts:
+    print(type(part), getattr(part, "mime_type", None))
+```
+
+Attachments are ephemeral in built-in persistence. Live requests include the
+file bytes, URI, or provider file ID, but saved/reloaded histories retain only a
+text placeholder with the filename/type so the model can see that an attachment
+was present. Applications that need durable file context should store files in
+their own attachment store and reattach them on follow-up messages.
+
 ### OpenRouter Models And Caching
 
 Use `OpenRouterProvider` for OpenRouter-hosted models such as Kimi and

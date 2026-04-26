@@ -29,8 +29,21 @@ import logging
 from dataclasses import asdict, is_dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
+from urllib.parse import urlparse
 
-from agent_core.providers.types import ParsedResponse, TokenUsage, ToolCall
+from agent_core.core.attachments import format_attachment_placeholder
+from agent_core.providers.types import (
+    FilePart,
+    FileOutputPart,
+    ParsedResponse,
+    TextPart,
+    TextOutputPart,
+    TokenUsage,
+    ToolCall,
+    UnsupportedInputPart,
+    UserMessageInput,
+    coerce_user_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +112,25 @@ def _read_field(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
+def _filename_from_uri(uri: str | None) -> str | None:
+    if not uri:
+        return None
+    if uri.startswith("data:"):
+        return None
+    parsed = urlparse(uri)
+    path = parsed.path or uri
+    name = path.rsplit("/", 1)[-1]
+    return name or None
+
+
+def _mime_from_data_url(data_url: str | None) -> str | None:
+    if not data_url or not data_url.startswith("data:"):
+        return None
+    header = data_url.split(",", 1)[0]
+    mime = header[5:].split(";", 1)[0]
+    return mime or None
+
+
 def _normalize_cache_config(cache_config: Any | None) -> dict[str, Any]:
     """Normalize provider cache hints into a plain dict.
 
@@ -149,6 +181,12 @@ class OpenAIProvider:
             (dict). Per-call ``cache_config`` values override these defaults.
         include_stream_usage: If ``True``, request usage accounting on streamed
             OpenAI-compatible responses where the API supports it.
+        allow_file_urls: If ``True``, URI-backed non-image ``FilePart`` values
+            are encoded as file content. Standard OpenAI Chat Completions does
+            not support file URLs, but OpenRouter does.
+        file_data_format: How inline non-image files are encoded in ``file``
+            content parts: ``"base64"`` for OpenAI Chat, ``"data_url"`` for
+            OpenRouter.
     """
 
     def __init__(
@@ -160,6 +198,8 @@ class OpenAIProvider:
         extra_headers: dict | None = None,
         cache_config: dict | None = None,
         include_stream_usage: bool = True,
+        allow_file_urls: bool = False,
+        file_data_format: str = "base64",
     ) -> None:
         self._client = client
         self._preserve_reasoning = preserve_reasoning
@@ -167,6 +207,10 @@ class OpenAIProvider:
         self._extra_headers = extra_headers or {}
         self._cache_config = cache_config or {}
         self._include_stream_usage = include_stream_usage
+        self._allow_file_urls = allow_file_urls
+        if file_data_format not in {"base64", "data_url"}:
+            raise ValueError("file_data_format must be 'base64' or 'data_url'")
+        self._file_data_format = file_data_format
 
     @property
     def client(self) -> Any:
@@ -323,9 +367,12 @@ class OpenAIProvider:
         choice = response.choices[0]
         message = choice.message
 
-        text = getattr(message, "content", None)
+        text = self._content_to_display_text(getattr(message, "content", None) or "")
         tool_calls: list[ToolCall] = []
         thinking_text: str | None = None
+        output_parts: list[TextOutputPart | FileOutputPart] = []
+        if text:
+            output_parts.append(TextOutputPart(text))
 
         message_tool_calls = getattr(message, "tool_calls", None)
         if message_tool_calls:
@@ -356,6 +403,11 @@ class OpenAIProvider:
                 usage.cached_tokens = _read_field(details, "cached_tokens", 0) or 0
                 usage.cache_write_tokens = _read_field(details, "cache_write_tokens", 0) or 0
 
+        for image in getattr(message, "images", None) or []:
+            file_output = self._file_output_from_image_output(image)
+            if file_output is not None:
+                output_parts.append(file_output)
+
         raw_msg = self._message_to_dict(message)
 
         return ParsedResponse(
@@ -365,14 +417,75 @@ class OpenAIProvider:
             usage=usage,
             thinking_text=thinking_text,
             streamed_text=bool(getattr(response, "_agent_core_streamed_text", False)),
+            output_parts=[] if tool_calls else output_parts,
         )
 
     # ------------------------------------------------------------------
     # Message construction
     # ------------------------------------------------------------------
 
-    def build_user_message(self, text: str) -> Any:
-        return {"role": "user", "content": text}
+    def _build_file_content_part(self, part: FilePart) -> dict[str, Any]:
+        if part.is_image and part.file_id is None:
+            if part.uri is not None:
+                image_url = part.uri
+            elif part.data is not None:
+                image_url = part.to_data_url()
+            else:
+                raise UnsupportedInputPart(
+                    "OpenAIProvider does not support image file IDs through "
+                    "Chat Completions"
+                )
+            payload: dict[str, Any] = {"url": image_url}
+            if part.detail:
+                payload["detail"] = part.detail
+            return {"type": "image_url", "image_url": payload}
+
+        file_payload: dict[str, Any] = {}
+        if part.filename:
+            file_payload["filename"] = part.filename
+
+        if part.file_id is not None:
+            file_payload["file_id"] = part.file_id
+        elif part.data is not None:
+            file_payload["file_data"] = (
+                part.to_data_url()
+                if self._file_data_format == "data_url"
+                else part.to_base64()
+            )
+        elif part.uri is not None:
+            if not self._allow_file_urls:
+                raise UnsupportedInputPart(
+                    "OpenAIProvider does not support non-image file URI inputs "
+                    "through Chat Completions; use inline data, file_id, or a "
+                    "Responses provider."
+                )
+            file_payload["file_data"] = part.uri
+
+        return {"type": "file", "file": file_payload}
+
+    def build_user_message(self, message: UserMessageInput) -> Any:
+        user_message = coerce_user_message(message)
+        if all(isinstance(part, TextPart) for part in user_message.parts):
+            return {
+                "role": "user",
+                "content": "\n".join(
+                    part.text
+                    for part in user_message.parts
+                    if isinstance(part, TextPart)
+                ),
+            }
+
+        content_parts: list[dict[str, Any]] = []
+        for part in user_message.parts:
+            if isinstance(part, TextPart):
+                content_parts.append({"type": "text", "text": part.text})
+            elif isinstance(part, FilePart):
+                content_parts.append({"type": "text", "text": part.live_label()})
+                content_parts.append(self._build_file_content_part(part))
+        return {
+            "role": "user",
+            "content": content_parts,
+        }
 
     def build_tool_result_messages(
         self,
@@ -425,7 +538,7 @@ class OpenAIProvider:
             total += len(enc.encode(system_prompt)) + 4
         for msg in messages:
             if isinstance(msg, dict):
-                content = msg.get("content", "")
+                content = self._content_to_display_text(msg.get("content", ""))
                 if content:
                     total += len(enc.encode(str(content))) + 4
                 # Rough estimate for tool calls
@@ -493,7 +606,24 @@ class OpenAIProvider:
 
     def serialize_message(self, message: Any) -> dict:
         if isinstance(message, dict):
-            return {**message, "_provider": "openai"}
+            serialized = dict(message)
+            if "images" in serialized:
+                image_placeholders = [
+                    placeholder
+                    for image in serialized.pop("images") or []
+                    if (
+                        placeholder := self._placeholder_from_image_output(image)
+                    ) is not None
+                ]
+                serialized["content"] = self._append_placeholders_to_content(
+                    serialized.get("content"),
+                    image_placeholders,
+                )
+            if "content" in serialized:
+                serialized["content"] = self._sanitize_content_for_persistence(
+                    serialized["content"]
+                )
+            return {**serialized, "_provider": "openai"}
         return {"_provider": "openai", "content": str(message)}
 
     def deserialize_message(self, data: dict) -> Any:
@@ -509,7 +639,7 @@ class OpenAIProvider:
         parts: list[str] = []
 
         if message.get("content"):
-            parts.append(str(message["content"]))
+            parts.append(self._content_to_display_text(message["content"]))
 
         if message.get("tool_calls"):
             for tc in message["tool_calls"]:
@@ -528,11 +658,123 @@ class OpenAIProvider:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _placeholder_from_content_part(self, part: dict[str, Any]) -> str:
+        part_type = part.get("type", "file")
+
+        if part_type == "image_url":
+            image_url = part.get("image_url") or {}
+            url = image_url.get("url") if isinstance(image_url, dict) else None
+            mime_type = _mime_from_data_url(url) or "image/*"
+            return format_attachment_placeholder(
+                mime_type=mime_type,
+                label=_filename_from_uri(url) or "image attachment",
+            )
+
+        if part_type == "file":
+            file_payload = part.get("file") or {}
+            if isinstance(file_payload, dict):
+                file_data = file_payload.get("file_data") or file_payload.get("fileData")
+                mime_type = _mime_from_data_url(file_data) or "application/octet-stream"
+                label = (
+                    file_payload.get("filename")
+                    or _filename_from_uri(file_data)
+                    or file_payload.get("file_id")
+                )
+            else:
+                mime_type = "application/octet-stream"
+                label = None
+            return format_attachment_placeholder(mime_type=mime_type, label=label)
+
+        if part_type == "input_audio":
+            return format_attachment_placeholder(
+                mime_type="audio/*",
+                label="audio attachment",
+            )
+
+        return format_attachment_placeholder(
+            mime_type="application/octet-stream",
+            label=f"{part_type} attachment",
+        )
+
+    def _file_output_from_image_output(self, image: Any) -> FileOutputPart | None:
+        image_url = _read_field(image, "image_url", None) or {}
+        url = _read_field(image_url, "url", None)
+        if not url:
+            return None
+
+        filename = _filename_from_uri(url)
+        if isinstance(url, str) and url.startswith("data:"):
+            return FileOutputPart.from_data_url(url, filename=filename)
+        return FileOutputPart(
+            uri=url,
+            mime_type=_mime_from_data_url(url) or "image/*",
+            filename=filename,
+        )
+
+    def _placeholder_from_image_output(self, image: Any) -> str | None:
+        image_url = _read_field(image, "image_url", None) or {}
+        url = _read_field(image_url, "url", None)
+        if not url:
+            return None
+        return self._placeholder_from_content_part({
+            "type": "image_url",
+            "image_url": {"url": url},
+        })
+
+    def _append_placeholders_to_content(
+        self,
+        content: Any,
+        placeholders: list[str],
+    ) -> Any:
+        if not placeholders:
+            return content
+
+        content_text = self._content_to_display_text(content) if content else ""
+        pieces = [piece for piece in [content_text, *placeholders] if piece]
+        return "\n".join(pieces)
+
+    def _sanitize_content_for_persistence(self, content: Any) -> Any:
+        if not isinstance(content, list):
+            return content
+
+        sanitized: list[dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                sanitized.append({"type": "text", "text": str(part)})
+                continue
+            if part.get("type") == "text":
+                sanitized.append(dict(part))
+            else:
+                sanitized.append({
+                    "type": "text",
+                    "text": self._placeholder_from_content_part(part),
+                })
+        return sanitized
+
+    def _content_to_display_text(self, content: Any) -> str:
+        if isinstance(content, list):
+            pieces: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    pieces.append(str(part))
+                elif part.get("type") == "text":
+                    pieces.append(str(part.get("text", "")))
+                else:
+                    pieces.append(self._placeholder_from_content_part(part))
+            return "\n".join(piece for piece in pieces if piece)
+        return str(content)
+
     def _message_to_dict(self, message: Any) -> dict:
         """Convert an OpenAI message object to a plain dict for history."""
         msg: dict[str, Any] = {"role": message.role}
 
         content = getattr(message, "content", None)
+        image_placeholders = [
+            placeholder
+            for image in getattr(message, "images", None) or []
+            if (placeholder := self._placeholder_from_image_output(image)) is not None
+        ]
+        content = self._append_placeholders_to_content(content, image_placeholders)
         if content:
             msg["content"] = content
 

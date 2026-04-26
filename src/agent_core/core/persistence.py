@@ -22,6 +22,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from google.genai import types
 
+from agent_core.core.attachments import format_attachment_placeholder
+
 logger = logging.getLogger(__name__)
 
 
@@ -126,11 +128,35 @@ def serialize_content(content: types.Content) -> dict[str, Any]:
             })
 
         elif hasattr(part, "inline_data") and part.inline_data:
-            # Skip binary data (images) - too large for conversation resumption
             serialized_parts.append({
-                "type": "inline_data",
+                "type": "ephemeral_file",
                 "mime_type": getattr(part.inline_data, "mime_type", "unknown"),
-                "skipped": True,
+                "placeholder": format_attachment_placeholder(
+                    mime_type=getattr(
+                        part.inline_data,
+                        "mime_type",
+                        "application/octet-stream",
+                    )
+                ),
+            })
+
+        elif hasattr(part, "file_data") and part.file_data:
+            file_uri = getattr(part.file_data, "file_uri", None) or getattr(
+                part.file_data, "fileUri", None
+            )
+            mime_type = getattr(
+                part.file_data,
+                "mime_type",
+                getattr(part.file_data, "mimeType", "application/octet-stream"),
+            )
+            label = file_uri.rsplit("/", 1)[-1] if file_uri else None
+            serialized_parts.append({
+                "type": "ephemeral_file",
+                "mime_type": mime_type,
+                "placeholder": format_attachment_placeholder(
+                    mime_type=mime_type,
+                    label=label,
+                ),
             })
 
         elif hasattr(part, "thought") and part.thought:
@@ -170,9 +196,16 @@ def deserialize_content(data: dict[str, Any]) -> types.Content:
             if thought_text:
                 parts.append(types.Part.from_text(text=thought_text))
 
-        elif part_type == "inline_data":
-            # Binary data was intentionally skipped during serialization
-            pass
+        elif part_type in {"inline_data", "ephemeral_file"}:
+            placeholder = part_data.get("placeholder")
+            if not placeholder:
+                placeholder = format_attachment_placeholder(
+                    mime_type=part_data.get(
+                        "mime_type",
+                        "application/octet-stream",
+                    )
+                )
+            parts.append(types.Part.from_text(text=placeholder))
 
         else:
             logger.warning("Unknown part type during deserialization: %s", part_type)

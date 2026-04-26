@@ -11,10 +11,21 @@ from agent_core.core.events import (
     emit_event,
 )
 from agent_core.providers import (
+    AgentResponse,
+    FilePart,
+    FileOutputPart,
     LLMProvider,
+    MessagePart,
+    OutputPart,
     ToolCall,
     TokenUsage,
     ParsedResponse,
+    TextPart,
+    TextOutputPart,
+    UnsupportedInputPart,
+    UserMessage,
+    UserMessageInput,
+    coerce_user_message,
 )
 from agent_core.providers.gemini import GeminiProvider
 
@@ -26,10 +37,21 @@ __all__ = [
     "generate_instance_id",
     # Providers
     "LLMProvider",
+    "AgentResponse",
+    "FilePart",
+    "FileOutputPart",
     "GeminiProvider",
+    "MessagePart",
+    "OutputPart",
+    "TextPart",
+    "TextOutputPart",
     "ToolCall",
     "TokenUsage",
     "ParsedResponse",
+    "UnsupportedInputPart",
+    "UserMessage",
+    "UserMessageInput",
+    "coerce_user_message",
     # Events
     "EventType",
     "EventStatus",

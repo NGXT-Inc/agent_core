@@ -17,7 +17,19 @@ from google import genai
 from google.genai import types
 from google.genai.errors import ClientError
 
-from agent_core.providers.types import ParsedResponse, TokenUsage, ToolCall
+from agent_core.core.attachments import format_attachment_placeholder
+from agent_core.providers.types import (
+    FilePart,
+    FileOutputPart,
+    ParsedResponse,
+    TextPart,
+    TextOutputPart,
+    TokenUsage,
+    ToolCall,
+    UnsupportedInputPart,
+    UserMessageInput,
+    coerce_user_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +49,28 @@ def _json_safe(value: Any) -> Any:
 
 def _is_file_attachment(value: Any) -> bool:
     return isinstance(value, dict) and ("data" in value or "gcs_uri" in value)
+
+
+def _tool_attachment_to_file_part(value: dict) -> FilePart:
+    mime_type = value.get("mime_type", "application/octet-stream")
+    filename = value.get("filename")
+    description = value.get("description")
+    detail = value.get("detail")
+    if "gcs_uri" in value:
+        return FilePart.from_uri(
+            value["gcs_uri"],
+            mime_type=mime_type,
+            filename=filename,
+            description=description,
+            detail=detail,
+        )
+    return FilePart.from_bytes(
+        value.get("data", b""),
+        mime_type=mime_type,
+        filename=filename,
+        description=description,
+        detail=detail,
+    )
 
 
 @dataclass(slots=True)
@@ -251,17 +285,20 @@ class GeminiProvider:
 
         # Empty response
         if not response.candidates or not response.candidates[0].content:
+            text = response.text or ""
             return ParsedResponse(
-                text=response.text or "",
+                text=text,
                 tool_calls=[],
                 raw_message=None,
                 usage=usage,
                 streamed_text=bool(getattr(response, "_agent_core_streamed_text", False)),
+                output_parts=[TextOutputPart(text)] if text else [],
             )
 
         model_content = response.candidates[0].content
 
         text_parts: list[str] = []
+        output_parts: list[TextOutputPart | FileOutputPart] = []
         tool_calls: list[ToolCall] = []
 
         for part in model_content.parts:
@@ -274,6 +311,39 @@ class GeminiProvider:
                 ))
             elif hasattr(part, "text") and part.text:
                 text_parts.append(part.text)
+                output_parts.append(TextOutputPart(part.text))
+            elif hasattr(part, "inline_data") and part.inline_data:
+                output_parts.append(
+                    FileOutputPart(
+                        data=getattr(part.inline_data, "data", b""),
+                        mime_type=getattr(
+                            part.inline_data,
+                            "mime_type",
+                            "application/octet-stream",
+                        ),
+                    )
+                )
+            elif hasattr(part, "file_data") and part.file_data:
+                file_uri = getattr(part.file_data, "file_uri", None) or getattr(
+                    part.file_data,
+                    "fileUri",
+                    None,
+                )
+                if file_uri:
+                    output_parts.append(
+                        FileOutputPart(
+                            uri=file_uri,
+                            mime_type=getattr(
+                                part.file_data,
+                                "mime_type",
+                                getattr(
+                                    part.file_data,
+                                    "mimeType",
+                                    "application/octet-stream",
+                                ),
+                            ),
+                        )
+                    )
 
         # Determine thinking vs. final text
         thinking_text = None
@@ -287,6 +357,10 @@ class GeminiProvider:
         # Fall back to response.text for the final string if no parts parsed
         if text is None and not tool_calls:
             text = response.text or ""
+        if text and not tool_calls and not any(
+            isinstance(part, TextOutputPart) for part in output_parts
+        ):
+            output_parts.insert(0, TextOutputPart(text))
 
         return ParsedResponse(
             text=text,
@@ -295,16 +369,45 @@ class GeminiProvider:
             usage=usage,
             thinking_text=thinking_text,
             streamed_text=bool(getattr(response, "_agent_core_streamed_text", False)),
+            output_parts=[] if tool_calls else output_parts,
         )
 
     # ------------------------------------------------------------------
     # Message construction
     # ------------------------------------------------------------------
 
-    def build_user_message(self, text: str) -> Any:
+    def _append_file_part(self, parts: list[Any], file_part: FilePart) -> None:
+        parts.append(types.Part.from_text(text=file_part.live_label()))
+        if file_part.uri is not None:
+            parts.append(
+                types.Part.from_uri(
+                    file_uri=file_part.uri,
+                    mime_type=file_part.mime_type,
+                )
+            )
+        elif file_part.data is not None:
+            parts.append(
+                types.Part.from_bytes(
+                    data=file_part.data,
+                    mime_type=file_part.mime_type,
+                )
+            )
+        else:
+            raise UnsupportedInputPart(
+                "GeminiProvider does not support provider file IDs"
+            )
+
+    def build_user_message(self, message: UserMessageInput) -> Any:
+        user_message = coerce_user_message(message)
+        parts: list[Any] = []
+        for part in user_message.parts:
+            if isinstance(part, TextPart):
+                parts.append(types.Part.from_text(text=part.text))
+            elif isinstance(part, FilePart):
+                self._append_file_part(parts, part)
         return types.Content(
             role="user",
-            parts=[types.Part.from_text(text=text)],
+            parts=parts,
         )
 
     def build_tool_result_messages(
@@ -363,33 +466,20 @@ class GeminiProvider:
                 if not isinstance(item, dict):
                     continue
 
-                mime_type = item.get("mime_type", "application/octet-stream")
-                description = item.get("description", "")
-
-                if description:
-                    label = "PDF" if mime_type == "application/pdf" else "File"
-                    parts.append(
-                        types.Part.from_text(
-                            text=f"[{label} from {func_name}: {description}]"
-                        )
-                    )
-
-                if "gcs_uri" in item:
-                    gcs_uri = item["gcs_uri"]
-                    parts.append(
-                        types.Part.from_uri(file_uri=gcs_uri, mime_type=mime_type)
-                    )
+                file_part = _tool_attachment_to_file_part(item)
+                self._append_file_part(parts, file_part)
+                if file_part.uri:
                     logger.debug(
-                        "Attached GCS file to context: %s (%s)", gcs_uri, mime_type
+                        "Attached GCS file to context: %s (%s)",
+                        file_part.uri,
+                        file_part.mime_type,
                     )
-                elif "data" in item:
-                    item_data = item["data"]
-                    parts.append(
-                        types.Part.from_bytes(data=item_data, mime_type=mime_type)
-                    )
+                elif file_part.data is not None:
                     logger.debug(
                         "Attached inline %s to context: %s (%d bytes)",
-                        mime_type, description or func_name, len(item_data),
+                        file_part.mime_type,
+                        file_part.description or file_part.filename or func_name,
+                        len(file_part.data),
                     )
 
         return types.Content(role="user", parts=parts)
@@ -510,9 +600,34 @@ class GeminiProvider:
 
             elif hasattr(part, "inline_data") and part.inline_data:
                 serialized_parts.append({
-                    "type": "inline_data",
+                    "type": "ephemeral_file",
                     "mime_type": getattr(part.inline_data, "mime_type", "unknown"),
-                    "skipped": True,
+                    "placeholder": format_attachment_placeholder(
+                        mime_type=getattr(
+                            part.inline_data,
+                            "mime_type",
+                            "application/octet-stream",
+                        )
+                    ),
+                })
+
+            elif hasattr(part, "file_data") and part.file_data:
+                file_uri = getattr(part.file_data, "file_uri", None) or getattr(
+                    part.file_data, "fileUri", None
+                )
+                mime_type = getattr(
+                    part.file_data,
+                    "mime_type",
+                    getattr(part.file_data, "mimeType", "application/octet-stream"),
+                )
+                label = file_uri.rsplit("/", 1)[-1] if file_uri else None
+                serialized_parts.append({
+                    "type": "ephemeral_file",
+                    "mime_type": mime_type,
+                    "placeholder": format_attachment_placeholder(
+                        mime_type=mime_type,
+                        label=label,
+                    ),
                 })
 
             elif hasattr(part, "thought") and part.thought:
@@ -554,8 +669,16 @@ class GeminiProvider:
                 if thought_text:
                     parts.append(types.Part.from_text(text=thought_text))
 
-            elif part_type == "inline_data":
-                pass  # Binary data intentionally skipped during serialization
+            elif part_type in {"inline_data", "ephemeral_file"}:
+                placeholder = part_data.get("placeholder")
+                if not placeholder:
+                    placeholder = format_attachment_placeholder(
+                        mime_type=part_data.get(
+                            "mime_type",
+                            "application/octet-stream",
+                        )
+                    )
+                parts.append(types.Part.from_text(text=placeholder))
 
             else:
                 logger.warning(
@@ -582,6 +705,31 @@ class GeminiProvider:
             elif hasattr(part, "function_response") and part.function_response:
                 fr = part.function_response
                 parts_text.append(f"[Tool Response: {fr.name} -> {fr.response}]")
+            elif hasattr(part, "inline_data") and part.inline_data:
+                parts_text.append(
+                    format_attachment_placeholder(
+                        mime_type=getattr(
+                            part.inline_data,
+                            "mime_type",
+                            "application/octet-stream",
+                        )
+                    )
+                )
+            elif hasattr(part, "file_data") and part.file_data:
+                file_uri = getattr(part.file_data, "file_uri", None) or getattr(
+                    part.file_data,
+                    "fileUri",
+                    None,
+                )
+                mime_type = getattr(
+                    part.file_data,
+                    "mime_type",
+                    getattr(part.file_data, "mimeType", "application/octet-stream"),
+                )
+                label = file_uri.rsplit("/", 1)[-1] if file_uri else None
+                parts_text.append(
+                    format_attachment_placeholder(mime_type=mime_type, label=label)
+                )
 
         if parts_text:
             return {"role": role, "content": "\n".join(parts_text)}

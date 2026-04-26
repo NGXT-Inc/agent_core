@@ -319,6 +319,82 @@ class TestConversationHistory:
         assert len(agent._history) == 0
         agent.close()
 
+    def test_run_accepts_user_message(self, mock_env, mock_genai):
+        """run() should accept a provider-neutral UserMessage."""
+        from agent_core.agents.base import Agent
+        from agent_core.providers.types import UserMessage
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_text_response("reply")
+
+        agent = Agent()
+        result = agent.run(UserMessage.from_text("hello"))
+
+        assert result == "reply"
+        assert agent._history[0].parts[0].text == "hello"
+        agent.close()
+
+    def test_run_response_returns_structured_response(self, mock_env, mock_genai):
+        """run_response() should expose structured response parts."""
+        from agent_core.agents.base import Agent
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_text_response("reply")
+
+        agent = Agent()
+        response = agent.run_response("hello")
+
+        assert response.text == "reply"
+        assert response.parts[0].text == "reply"
+        assert response.token_usage["model"] == agent.model_name
+        agent.close()
+
+    def test_run_accepts_file_attachments(self, mock_env, mock_genai):
+        """run() should pass file attachments into the provider message."""
+        from agent_core.agents.base import Agent
+        from agent_core.providers.types import FilePart
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_text_response("reply")
+
+        agent = Agent()
+        result = agent.run(
+            "Describe this",
+            attachments=[
+                FilePart.from_bytes(
+                    b"png",
+                    mime_type="image/png",
+                    filename="plot.png",
+                )
+            ],
+        )
+
+        assert result == "reply"
+        sent_contents = mock_client.models.generate_content.call_args.kwargs["contents"]
+        assert sent_contents[0].parts[1].text == "[Attached file: plot.png (image/png)]"
+        assert sent_contents[0].parts[2].inline_data.data == b"png"
+        agent.close()
+
+    def test_run_stateless_adds_context_to_user_message(self, mock_env, mock_genai):
+        """run_stateless() should preserve UserMessage support with context."""
+        from agent_core.agents.base import Agent
+        from agent_core.providers.types import UserMessage
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.return_value = make_text_response("reply")
+
+        agent = Agent()
+        result = agent.run_stateless(
+            UserMessage.from_text("hello"),
+            context={"topic": "files"},
+        )
+
+        assert result == "reply"
+        sent_contents = mock_client.models.generate_content.call_args.kwargs["contents"]
+        assert sent_contents[0].parts[0].text == "Context:\ntopic: files\n\nTask: hello"
+        assert agent._history == []
+        agent.close()
+
     def test_clear_history(self, mock_env, mock_genai):
         """clear_history() should empty the history."""
         from agent_core.agents.base import Agent
