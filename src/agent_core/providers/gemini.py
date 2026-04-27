@@ -22,6 +22,7 @@ from agent_core.providers.types import (
     FilePart,
     FileOutputPart,
     ParsedResponse,
+    ProviderCapabilities,
     TextPart,
     TextOutputPart,
     TokenUsage,
@@ -531,6 +532,24 @@ class GeminiProvider:
     def supports_context_cache_registry(self, cache_registry: Any) -> bool:
         """Gemini can use the package's explicit Vertex context cache registry."""
         return True
+
+    def capabilities(self, model: str | None = None) -> ProviderCapabilities:
+        """Return Gemini input/output support.
+
+        The google-genai SDK accepts inline bytes and file URIs for supported
+        Gemini file modalities. Provider file IDs are not a Gemini input shape.
+        """
+        return ProviderCapabilities(
+            input_images=True,
+            input_image_bytes=True,
+            input_image_urls=True,
+            input_files=True,
+            input_file_bytes=True,
+            input_file_urls=True,
+            output_files=True,
+            tool_calling=True,
+            streaming=True,
+        )
 
     def adjust_compaction_tail_start(self, messages: list[Any], start: int) -> int:
         """Keep Gemini function-response messages paired with their calls."""

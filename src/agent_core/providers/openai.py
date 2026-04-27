@@ -36,6 +36,7 @@ from agent_core.providers.types import (
     FilePart,
     FileOutputPart,
     ParsedResponse,
+    ProviderCapabilities,
     TextPart,
     TextOutputPart,
     TokenUsage,
@@ -556,6 +557,21 @@ class OpenAIProvider:
     def supports_context_cache_registry(self, cache_registry: Any) -> bool:
         """OpenAI-compatible providers do not use Gemini explicit caches."""
         return False
+
+    def capabilities(self, model: str | None = None) -> ProviderCapabilities:
+        """Return OpenAI-compatible chat-completions input/output support."""
+        return ProviderCapabilities(
+            input_images=True,
+            input_image_bytes=True,
+            input_image_urls=True,
+            input_files=True,
+            input_file_bytes=True,
+            input_file_urls=self._allow_file_urls,
+            input_file_ids=True,
+            output_files=True,
+            tool_calling=True,
+            streaming=True,
+        )
 
     def adjust_compaction_tail_start(self, messages: list[Any], start: int) -> int:
         """Keep OpenAI tool-result messages paired with assistant tool calls."""

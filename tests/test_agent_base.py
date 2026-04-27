@@ -375,6 +375,35 @@ class TestConversationHistory:
         assert sent_contents[0].parts[2].inline_data.data == b"png"
         agent.close()
 
+    def test_run_validates_attachment_capabilities_before_history_append(self):
+        """run() should reject provider-unsupported attachment shapes early."""
+        from agent_core.agents.base import Agent
+        from agent_core.providers.openai import OpenAIProvider
+        from agent_core.providers.types import FilePart, UnsupportedInputPart
+
+        agent = Agent(
+            provider=OpenAIProvider(client=MagicMock()),
+            model_name="gpt-test",
+        )
+
+        with pytest.raises(
+            UnsupportedInputPart,
+            match="URI-backed non-image file attachments",
+        ):
+            agent.run(
+                "Read this",
+                attachments=[
+                    FilePart.from_uri(
+                        "https://example.com/paper.pdf",
+                        mime_type="application/pdf",
+                        filename="paper.pdf",
+                    )
+                ],
+            )
+
+        assert agent._history == []
+        agent.close()
+
     def test_run_stateless_adds_context_to_user_message(self, mock_env, mock_genai):
         """run_stateless() should preserve UserMessage support with context."""
         from agent_core.agents.base import Agent

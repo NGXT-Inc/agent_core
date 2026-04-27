@@ -123,6 +123,11 @@ text placeholder with the filename/type so the model can see that an attachment
 was present. Applications that need durable file context should store files in
 their own attachment store and reattach them on follow-up messages.
 
+Providers declare their input/output capabilities so unsupported attachment
+shapes fail before a model request is built. For example, standard
+OpenAI-compatible chat providers accept image URLs but reject non-image file
+URLs unless the provider explicitly enables that source.
+
 ### OpenRouter Models And Caching
 
 Use `OpenRouterProvider` for OpenRouter-hosted models such as Kimi and

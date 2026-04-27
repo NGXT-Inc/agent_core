@@ -44,10 +44,12 @@ from agent_core.providers.types import (
     AgentResponse,
     FilePart,
     LLMProvider,
+    ProviderCapabilities,
     TextPart,
     TextOutputPart,
     TokenUsage,
     ToolCall,
+    UnsupportedInputPart,
     UserMessage,
     UserMessageInput,
     coerce_user_message,
@@ -365,6 +367,74 @@ class Agent:
                 exc,
             )
             return False
+
+    def _provider_capabilities(self) -> ProviderCapabilities:
+        """Return declared provider capabilities, defaulting to text-only."""
+        capabilities = getattr(self._provider, "capabilities", None)
+        if capabilities is None:
+            return ProviderCapabilities()
+        return capabilities(self.model_name)
+
+    def _validate_user_message(self, message: UserMessage) -> None:
+        """Validate provider-neutral user input before provider encoding."""
+        capabilities = self._provider_capabilities()
+        target = f"{type(self._provider).__name__} model {self.model_name}"
+
+        for part in message.parts:
+            if isinstance(part, TextPart):
+                if part.text and not capabilities.input_text:
+                    raise UnsupportedInputPart(
+                        f"{target} does not support text input."
+                    )
+            elif isinstance(part, FilePart):
+                self._validate_file_part(part, capabilities, target)
+
+    @staticmethod
+    def _validate_file_part(
+        part: FilePart,
+        capabilities: ProviderCapabilities,
+        target: str,
+    ) -> None:
+        if not capabilities.supports_input_mime_type(part.mime_type):
+            raise UnsupportedInputPart(
+                f"{target} does not support {part.mime_type} attachments."
+            )
+
+        if part.is_image:
+            if not capabilities.input_images:
+                raise UnsupportedInputPart(
+                    f"{target} does not support image attachments."
+                )
+            if part.data is not None and not capabilities.input_image_bytes:
+                raise UnsupportedInputPart(
+                    f"{target} does not support inline image attachments."
+                )
+            if part.uri is not None and not capabilities.input_image_urls:
+                raise UnsupportedInputPart(
+                    f"{target} does not support image URL attachments."
+                )
+            if part.file_id is not None and not capabilities.input_image_file_ids:
+                raise UnsupportedInputPart(
+                    f"{target} does not support provider image file IDs."
+                )
+            return
+
+        if not capabilities.input_files:
+            raise UnsupportedInputPart(
+                f"{target} does not support non-image file attachments."
+            )
+        if part.data is not None and not capabilities.input_file_bytes:
+            raise UnsupportedInputPart(
+                f"{target} does not support inline non-image file attachments."
+            )
+        if part.uri is not None and not capabilities.input_file_urls:
+            raise UnsupportedInputPart(
+                f"{target} does not support URI-backed non-image file attachments."
+            )
+        if part.file_id is not None and not capabilities.input_file_ids:
+            raise UnsupportedInputPart(
+                f"{target} does not support provider non-image file IDs."
+            )
 
     # --- Lifecycle Hooks (override in subclasses) ---
 
@@ -1582,6 +1652,7 @@ class Agent:
 
         def _execute() -> tuple[str, dict]:
             use_streaming = self.streaming if streaming is None else streaming
+            self._validate_user_message(user_message)
             self._history.append(self._provider.build_user_message(user_message))
             self._save_history()
 
@@ -1682,6 +1753,7 @@ class Agent:
         full_prompt = user_message.text
 
         def _execute() -> tuple[str, dict]:
+            self._validate_user_message(user_message)
             contents = [self._provider.build_user_message(user_message)]
             use_streaming = self.streaming if streaming is None else streaming
             return self._run_with_function_loop(

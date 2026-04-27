@@ -14,8 +14,9 @@ from agent_core.providers.types import (
     FilePart,
     FileOutputPart,
     LLMProvider,
-    TextOutputPart,
     ParsedResponse,
+    ProviderCapabilities,
+    TextOutputPart,
     TextPart,
     TokenUsage,
     ToolCall,
@@ -107,6 +108,15 @@ class TestMessageParts:
         assert str(response) == "hello"
         assert response.parts[1].data == b"img"
         assert response.parts[1].mime_type == "image/png"
+
+    def test_provider_capabilities_match_mime_type_wildcards(self):
+        capabilities = ProviderCapabilities(
+            supported_input_mime_types=("image/*", "application/pdf")
+        )
+
+        assert capabilities.supports_input_mime_type("image/png") is True
+        assert capabilities.supports_input_mime_type("application/pdf") is True
+        assert capabilities.supports_input_mime_type("text/plain") is False
 
 
 # ============================================================
@@ -209,6 +219,24 @@ class TestOpenAIProvider:
         from agent_core.providers.openai import OpenAIProvider
         mock_client = MagicMock()
         return OpenAIProvider(client=mock_client, **kwargs), mock_client
+
+    def test_capabilities_reflect_file_source_support(self):
+        provider, _ = self._make_provider()
+
+        capabilities = provider.capabilities("gpt-test")
+
+        assert capabilities.input_images is True
+        assert capabilities.input_image_bytes is True
+        assert capabilities.input_image_urls is True
+        assert capabilities.input_files is True
+        assert capabilities.input_file_bytes is True
+        assert capabilities.input_file_ids is True
+        assert capabilities.input_file_urls is False
+
+    def test_capabilities_allow_non_image_file_urls_when_configured(self):
+        provider, _ = self._make_provider(allow_file_urls=True)
+
+        assert provider.capabilities("openrouter-model").input_file_urls is True
 
     def _make_mock_response(
         self,
@@ -896,6 +924,13 @@ class TestOpenAIProvider:
 class TestOpenRouterProvider:
     """Test OpenRouter-specific provider configuration."""
 
+    def test_capabilities_allow_non_image_file_urls(self):
+        from agent_core.providers.openrouter import OpenRouterProvider
+
+        provider = OpenRouterProvider(client=MagicMock())
+
+        assert provider.capabilities("google/gemini-2.5-flash").input_file_urls is True
+
     def test_provider_applies_attribution_and_response_cache_headers(self):
         from agent_core.providers.openrouter import OpenRouterProvider
 
@@ -1034,6 +1069,20 @@ class TestOpenRouterProvider:
 
 class TestGeminiProvider:
     """Test GeminiProvider with mocked genai client."""
+
+    def test_capabilities_support_inline_and_uri_files(self):
+        from agent_core.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider(client=MagicMock())
+
+        capabilities = provider.capabilities("gemini-test")
+        assert capabilities.input_images is True
+        assert capabilities.input_image_bytes is True
+        assert capabilities.input_image_urls is True
+        assert capabilities.input_files is True
+        assert capabilities.input_file_bytes is True
+        assert capabilities.input_file_urls is True
+        assert capabilities.input_file_ids is False
 
     def test_parse_text_response(self):
         from unittest.mock import patch

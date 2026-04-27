@@ -24,6 +24,48 @@ class UnsupportedInputPart(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    """Provider/model features used for early input validation.
+
+    Empty ``supported_input_mime_types`` means the provider accepts any MIME
+    type for the modalities and sources it otherwise supports. Entries may be
+    exact MIME types (``"application/pdf"``) or type wildcards
+    (``"image/*"``).
+    """
+
+    input_text: bool = True
+    input_images: bool = False
+    input_image_bytes: bool = False
+    input_image_urls: bool = False
+    input_image_file_ids: bool = False
+    input_files: bool = False
+    input_file_bytes: bool = False
+    input_file_urls: bool = False
+    input_file_ids: bool = False
+    output_text: bool = True
+    output_files: bool = False
+    tool_calling: bool = True
+    streaming: bool = True
+    supported_input_mime_types: tuple[str, ...] = ()
+
+    def supports_input_mime_type(self, mime_type: str) -> bool:
+        """Return whether *mime_type* is allowed by the provider."""
+        if not self.supported_input_mime_types:
+            return True
+
+        normalized = (mime_type or "application/octet-stream").lower()
+        for allowed in self.supported_input_mime_types:
+            candidate = allowed.lower()
+            if candidate in {"*", "*/*"}:
+                return True
+            if candidate.endswith("/*") and normalized.startswith(candidate[:-1]):
+                return True
+            if candidate == normalized:
+                return True
+        return False
+
+
+@dataclass(frozen=True, slots=True)
 class TextPart:
     """A text segment inside a provider-neutral user message."""
 
@@ -454,6 +496,13 @@ class LLMProvider(Protocol):
         Providers with paired tool-call/tool-result messages should move
         ``start`` backward when needed so the preserved tail remains a valid
         conversation transcript.
+        """
+        ...
+
+    def capabilities(self, model: str | None = None) -> ProviderCapabilities:
+        """Return provider/model feature support for validation and routing.
+
+        Providers may ignore *model* when capabilities are not model-specific.
         """
         ...
 
