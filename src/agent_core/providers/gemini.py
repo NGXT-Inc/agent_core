@@ -19,6 +19,8 @@ from google.genai.errors import ClientError
 
 from agent_core.core.attachments import format_attachment_placeholder
 from agent_core.providers.types import (
+    CanonicalMessage,
+    CanonicalRole,
     FilePart,
     FileOutputPart,
     ParsedResponse,
@@ -97,6 +99,23 @@ class _StreamedGenerateContentResponse:
     @property
     def text(self) -> str:
         return self._text
+
+
+def _canonical_role_for_gemini(serialized: dict) -> CanonicalRole:
+    """Map a serialized Gemini message to a canonical role.
+
+    Gemini packs every tool-result into a ``role="user"`` Content with one or
+    more function-response Parts. We surface those as canonical role ``"tool"``
+    so compaction policies and downstream readers can tell them apart from a
+    real user turn.
+    """
+    role = serialized.get("role", "user")
+    if role == "model":
+        return "assistant"
+    parts = serialized.get("parts", [])
+    if any(p.get("type") == "function_response" for p in parts):
+        return "tool"
+    return "user"
 
 
 class GeminiProvider:
@@ -705,6 +724,45 @@ class GeminiProvider:
                 )
 
         return types.Content(role=data.get("role", "user"), parts=parts)
+
+    # ------------------------------------------------------------------
+    # Canonical form
+    # ------------------------------------------------------------------
+
+    PROVIDER_TAG = "gemini"
+
+    def to_canonical(self, message: Any) -> CanonicalMessage:
+        """Serialize a Gemini ``Content`` to provider-neutral form."""
+        import json
+
+        serialized = self.serialize_message(message)
+        canonical_json = json.dumps(serialized, ensure_ascii=True, sort_keys=True)
+        return CanonicalMessage(
+            role=_canonical_role_for_gemini(serialized),
+            provider_tag=self.PROVIDER_TAG,
+            canonical_json=canonical_json,
+            approx_tokens=max(1, (len(canonical_json) + 3) // 4),
+            provider_native=message,
+        )
+
+    def from_canonical(self, message: CanonicalMessage) -> Any:
+        """Reconstruct a Gemini ``Content`` from canonical form."""
+        import json
+
+        if message.provider_native is not None:
+            return message.provider_native
+        if message.provider_tag != self.PROVIDER_TAG:
+            raise ValueError(
+                f"Cannot reconstruct Gemini message from provider "
+                f"{message.provider_tag!r}"
+            )
+        return self.deserialize_message(json.loads(message.canonical_json))
+
+    @staticmethod
+    def approx_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return max(1, (len(text) + 3) // 4)
 
     def format_message_for_display(self, message: Any) -> dict | None:
         """Format a Gemini Content for human-readable display."""

@@ -1,6 +1,13 @@
 # Agent Core
 
-Extensible agent orchestration framework with multi-provider function calling support.
+Extensible agent orchestration framework with multi-provider function calling
+support and a native C++ session registry / history store / cache manager.
+
+> **Architecture**: Provider implementations (Gemini, OpenAI, OpenRouter) and
+> the function-calling loop live in Python. Session storage, the global
+> registry, Vertex AI cache management, and compaction math live in a compiled
+> extension (`agent_core._native`). See
+> [`CPP_TRANSITION_PLAN.md`](CPP_TRANSITION_PLAN.md) for the migration story.
 
 ## Installation
 
@@ -14,6 +21,11 @@ Or in your `requirements.txt`:
 ```
 -e /path/to/LDIA/agent_core
 ```
+
+A C++20 toolchain (clang or gcc) and CMake ≥ 3.20 are required to build the
+native extension. On macOS the Xcode command-line tools are sufficient; on
+Linux any reasonably recent system clang/gcc works. SQLite3 development headers
+must be available — they ship with macOS and most Linux distros.
 
 ### Within LDIA
 
@@ -62,6 +74,39 @@ class ResearcherAgent(Agent):
 agent = ResearcherAgent()
 response = agent.run("Find papers about transformer architectures")
 ```
+
+### Hierarchical sessions and the global registry
+
+Any agent constructed with a `session_id` acquires a slot in the process-wide
+native registry. Sub-agents spawned from a parent inherit a hierarchical
+session id that encodes the tree as a `:` -separated string:
+
+```python
+from agent_core import Agent, registry
+
+class DesignerAgent(Agent):
+    name = "designer"
+
+class ExplorerAgent(Agent):
+    name = "explorer"
+
+designer = DesignerAgent(session_id="user-42")
+explorer = designer.spawn(ExplorerAgent)
+# explorer.session_id == "user-42:explorer-7f3a"  (random 8-hex suffix)
+
+# Any other script in the same process sees the same registry — no setup.
+registry.list_active()                  # ["user-42", "user-42:explorer-7f3a"]
+registry.session_info("user-42")        # {"message_count": …, "ref_count": 1, …}
+
+# Cancel the whole agent subtree from anywhere.
+registry.cancel_subtree("user-42")
+```
+
+Idle sessions stay resident for 30 minutes by default
+(`registry.set_idle_ttl_seconds(...)`) and are then evicted by a background
+reaper. Persistent state (when a SQLite-backed conversation store is in use)
+survives eviction — re-acquiring the same `session_id` resurrects the history
+from disk.
 
 ### Streaming Text
 

@@ -39,7 +39,11 @@ from agent_core.agents.compaction import (
 )
 from agent_core.core.caching import ContextCacheRegistry
 from agent_core.core.events import EventBus, EventType, EventStatus, Event, get_event_bus, emit_event
-from agent_core.core.persistence import ConversationStoreProtocol
+from agent_core.core.native_history import NativeHistory
+from agent_core.core.persistence import (
+    ConversationStoreProtocol,
+    SQLiteConversationStore,
+)
 from agent_core.providers.types import (
     AgentResponse,
     FilePart,
@@ -246,6 +250,7 @@ class Agent:
         event_bus: EventBus | None = None,
         cache_registry: ContextCacheRegistry | None = None,
         streaming: bool | None = None,
+        db_path: str | None = None,
     ):
         """Initialize the agent.
 
@@ -274,6 +279,10 @@ class Agent:
             streaming: Optional default for run()/run_stateless(). If None,
                        uses class DEFAULT_STREAMING. Per-call arguments
                        still take priority.
+            db_path: Optional SQLite database path. If set (with session_id),
+                     persistence routes through the C++ background writer.
+                     If omitted but *conversation_store* is a
+                     ``SQLiteConversationStore``, that store's db_path is used.
         """
         from agent_core.providers.gemini import GeminiProvider
 
@@ -310,14 +319,50 @@ class Agent:
         # Provider-specific tool declarations (built via provider.build_tool_schemas)
         self._tool_schemas: Any | None = None
 
-        # Conversation persistence
+        # Conversation persistence — three paths:
+        #   * session_id + db_path (or SQLite-backed store) → C++ NativeHistory,
+        #     persisted via the background SqliteWriter.
+        #   * session_id + custom (non-SQLite) store → C++ NativeHistory in
+        #     memory plus Python-side store.save() on every mutation, for
+        #     backward compatibility with Redis/etc.
+        #   * no session_id → plain in-memory Python list (no persistence).
         self._conversation_store = conversation_store
-        if session_id and self._conversation_store:
-            self._history: list[Any] = self._conversation_store.load(
-                session_id, self.name
+
+        resolved_db_path = db_path
+        if (
+            session_id
+            and resolved_db_path is None
+            and isinstance(conversation_store, SQLiteConversationStore)
+        ):
+            resolved_db_path = str(conversation_store.db_path)
+
+        # Session handle: acquired from the global C++ registry whenever a
+        # session_id is set. Holding the handle bumps the session's refcount,
+        # and the matching close() in Agent.close() releases it. Sessions that
+        # outlive every handle become eligible for the registry's idle reaper.
+        self._session_handle: Any = None
+        self._history: Any
+        if session_id is not None:
+            from agent_core import _native
+
+            self._session_handle = _native.registry.acquire(
+                session_id, self.name, resolved_db_path or ""
             )
+            self._history = NativeHistory(
+                provider=self._provider, store=self._session_handle.history()
+            )
+            # Bridge to non-SQLite Python stores: load existing state once at
+            # init, then mirror mutations through _save_history.
+            if (
+                conversation_store is not None
+                and not isinstance(conversation_store, SQLiteConversationStore)
+                and resolved_db_path is None
+            ):
+                loaded = conversation_store.load(session_id, self.name)
+                if loaded and len(self._history) == 0:
+                    self._history.extend(loaded)
         else:
-            self._history: list[Any] = []
+            self._history = []
         self._compaction_count = 0
         self._last_response: AgentResponse | None = None
 
@@ -674,16 +719,100 @@ class Agent:
         self._event_bus.emit(event)
         return event
 
+    # --- Identity helpers ---
+
+    @property
+    def session_id(self) -> str | None:
+        """The full hierarchical session id (e.g. ``"user-42:designer-7f3a"``)."""
+        return self._session_id
+
+    def spawn(
+        self,
+        child_cls: "type[Agent]",
+        *,
+        agent_type: str | None = None,
+        suffix: str | None = None,
+        **kwargs: Any,
+    ) -> "Agent":
+        """Construct a child agent whose session is a descendant of this one.
+
+        The child's ``session_id`` is composed as
+        ``f"{parent.session_id}:{name}-{suffix}"`` where *name* is
+        ``child_cls.name`` (or ``agent_type`` if provided) and *suffix* defaults
+        to a random 8-hex-character token. Cancelling the parent's subtree via
+        ``registry.cancel_subtree`` automatically reaches the child.
+
+        Keyword arguments are forwarded to ``child_cls.__init__``. The ``provider``
+        is inherited from the parent unless explicitly overridden; the ``db_path``
+        (or SQLite-backed ``conversation_store``) is likewise reused.
+
+        Raises ``RuntimeError`` if the parent has no ``session_id``.
+        """
+        if not self._session_id:
+            raise RuntimeError(
+                "Agent.spawn() requires the parent to have a session_id set."
+            )
+        if ":" in (agent_type or "") or (suffix is not None and ":" in suffix):
+            raise ValueError(
+                "':' is reserved as the hierarchy separator in session ids."
+            )
+        name = agent_type or child_cls.name
+        if not name or ":" in name:
+            raise ValueError(
+                f"child agent name must be non-empty and ':'-free, got {name!r}"
+            )
+        token = suffix if suffix is not None else uuid.uuid4().hex[:8]
+        child_sid = f"{self._session_id}:{name}-{token}"
+
+        kwargs.setdefault("provider", self._provider)
+        kwargs.setdefault("parent_agent", self.instance_id)
+
+        # Reuse the parent's SQLite-backed persistence path when possible so
+        # the child's history lives in the same database file.
+        if "db_path" not in kwargs and self._session_handle is not None:
+            db_path = self._session_handle.db_path
+            if db_path:
+                kwargs["db_path"] = db_path
+        if "conversation_store" not in kwargs:
+            kwargs["conversation_store"] = self._conversation_store
+
+        kwargs["session_id"] = child_sid
+        return child_cls(**kwargs)
+
     # --- Cancellation ---
 
-    def cancel(self) -> None:
+    def cancel(self, recursive: bool = True) -> None:
         """Request cancellation of the current run.
 
-        Thread-safe. The agent will stop after completing any
-        in-progress tool executions. The run() or run_stateless()
-        call will return "[Cancelled]".
+        Thread-safe. Sets the local ``cancel_event`` and (when this agent is
+        registered with the global session registry) flags the session as
+        cancelled. With ``recursive=True`` (default), every descendant session
+        in the hierarchy is also flagged via the registry.
+
+        The agent will stop after completing any in-progress tool executions.
+        The ``run()`` / ``run_stateless()`` call will return ``"[Cancelled]"``.
         """
         self._cancel_event.set()
+        if self._session_handle is not None and self._session_id:
+            if recursive:
+                from agent_core import _native
+
+                _native.registry.cancel_subtree(self._session_id)
+            else:
+                self._session_handle.cancel()
+
+    def _is_cancel_requested(self) -> bool:
+        """Single source of truth for the cancellation poll inside the loop.
+
+        Combines the local event (legacy parent-shared cancellation) with the
+        session's cancellation atomic (registry subtree cancellation). Either
+        being set means we abort.
+        """
+        if self._cancel_event.is_set():
+            return True
+        if self._session_handle is not None and self._session_handle.is_cancelled:
+            return True
+        return False
 
     # --- Tool Registration ---
 
@@ -872,7 +1001,10 @@ class Agent:
 
     def clear_history(self) -> None:
         """Clear conversation history (in-memory and persistent)."""
-        self._history = []
+        if isinstance(self._history, NativeHistory):
+            self._history.clear()
+        else:
+            self._history = []
         if self._session_id and self._conversation_store:
             self._conversation_store.clear(self._session_id, self.name)
         if self._cache_enabled:
@@ -887,10 +1019,16 @@ class Agent:
             self._instance_cache_registry.invalidate(self.instance_id)
 
     def close(self) -> None:
-        """Clean up agent resources (unregisters from cache registry)."""
+        """Clean up agent resources (release session handle, unregister cache)."""
         if self._cache_enabled:
             self._instance_cache_registry.unregister(self.instance_id)
             self._cache_enabled = False
+        if self._session_handle is not None:
+            try:
+                self._session_handle.close()
+            except Exception:
+                pass
+            self._session_handle = None
 
     def __del__(self):
         try:
@@ -899,9 +1037,28 @@ class Agent:
             pass
 
     def _save_history(self) -> None:
-        """Save conversation history to persistent storage."""
-        if self._session_id and self._conversation_store:
-            self._conversation_store.save(self._session_id, self.name, self._history)
+        """Save conversation history to persistent storage.
+
+        When the in-memory store is the C++ ``NativeHistory`` and the
+        conversation store is a ``SQLiteConversationStore`` (or no store is
+        configured at all), the background writer already handles
+        persistence — this method is a no-op in that case. For custom Python
+        stores we still mirror every mutation so Redis/etc. backends keep
+        working.
+        """
+        if not (self._session_id and self._conversation_store):
+            return
+        if isinstance(self._history, NativeHistory) and isinstance(
+            self._conversation_store, SQLiteConversationStore
+        ):
+            # C++ writer owns this path.
+            return
+        snapshot = (
+            list(self._history)
+            if isinstance(self._history, NativeHistory)
+            else self._history
+        )
+        self._conversation_store.save(self._session_id, self.name, snapshot)
 
     # --- Result Summarization ---
 
@@ -1370,7 +1527,7 @@ class Agent:
                         func_name = tool_calls[idx].name
                         results[idx] = (func_name, {"error": str(e)})
 
-                if self._cancel_event.is_set() and remaining:
+                if self._is_cancel_requested() and remaining:
                     # Cancel pending futures and fill placeholders
                     cancelled = True
                     for future in remaining:
@@ -1427,9 +1584,12 @@ class Agent:
                         "[%s] Retryable error (attempt %d/%d), retrying in %.1fs: %s",
                         self.name, attempt, self.RETRY_MAX_ATTEMPTS, delay, e,
                     )
-                    # Use cancel event as sleep — wakes immediately on cancel
+                    # Use cancel event as sleep — wakes immediately on cancel.
+                    # Note: this still wakes only on the local event; a registry
+                    # subtree-cancel without a local set won't wake the sleep,
+                    # but the next poll point above the call site will catch it.
                     if self._cancel_event.wait(timeout=delay):
-                        return None  # Caller checks cancel_event
+                        return None  # Caller checks _is_cancel_requested()
                 else:
                     raise
 
@@ -1496,7 +1656,7 @@ class Agent:
             iteration += 1
 
             # Check for cancellation before each API call
-            if self._cancel_event.is_set():
+            if self._is_cancel_requested():
                 return "[Cancelled]", _usage_dict()
 
             while True:
@@ -1513,7 +1673,7 @@ class Agent:
                 if not compacted:
                     break
                 cache_config = None
-                if self._cancel_event.is_set():
+                if self._is_cancel_requested():
                     return "[Cancelled]", _usage_dict()
 
             try:
@@ -1640,7 +1800,7 @@ class Agent:
                 self._save_history()
 
             # Check for cancellation after tool execution
-            if self._cancel_event.is_set():
+            if self._is_cancel_requested():
                 return "[Cancelled]", _usage_dict()
 
             # Mid-loop: notify registry (may fire new cache) and re-query
@@ -1717,6 +1877,13 @@ class Agent:
         """
         if self._owns_cancel_event:
             self._cancel_event.clear()
+        # Clear the registry's cancellation flag for this session only — we
+        # do NOT touch descendants, since a parent's clear should not unflag
+        # children that were independently cancelled (and registry.cancel_subtree
+        # is what set the flag in the first place, so a fresh run on the root
+        # implies the user wants the root to proceed).
+        if self._session_handle is not None:
+            self._session_handle.clear_cancellation()
 
         self._compaction_count = 0
         self._last_response = None

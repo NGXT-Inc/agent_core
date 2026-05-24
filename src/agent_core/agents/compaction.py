@@ -1,10 +1,19 @@
-"""Conversation compaction helpers shared by agent runtimes."""
+"""Conversation compaction helpers shared by agent runtimes.
+
+The hot-path math (token estimation, tail selection, transcript trimming) is
+implemented in C++ via ``agent_core._native`` and delegated through the
+helpers below. The provider-specific bits (rendering a provider-native
+message into a transcript line; adjusting the tail boundary to respect
+tool-call/result pairs) stay in Python.
+"""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from typing import Any
+
+from agent_core import _native
 
 DEFAULT_TRIGGER_RATIO_NUMERATOR = 4
 DEFAULT_TRIGGER_RATIO_DENOMINATOR = 5
@@ -51,9 +60,8 @@ class CompactionConfig:
 
 
 def approximate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return max(1, (len(text) + 3) // 4)
+    """Cheap token estimate — delegated to the C++ helper for parity."""
+    return _native.approximate_tokens(text)
 
 
 def _stringify(value: Any) -> str:
@@ -104,12 +112,17 @@ def render_message_for_compaction(provider, message: Any, *, max_chars: int) -> 
 
 
 def estimate_history_tokens(provider, messages: list[Any], *, max_chars: int) -> int:
-    total = 0
-    for message in messages:
-        total += approximate_tokens(
-            render_message_for_compaction(provider, message, max_chars=max_chars)
-        )
-    return total
+    """Sum approximate_tokens across rendered messages.
+
+    The C++ helper takes the rendered strings directly — Python renders each
+    message via the provider (which knows how to read provider-native shapes)
+    and passes the resulting list into native code.
+    """
+    rendered = [
+        render_message_for_compaction(provider, m, max_chars=max_chars)
+        for m in messages
+    ]
+    return _native.estimate_history_tokens(rendered)
 
 
 def select_preserved_tail_start(
@@ -120,23 +133,48 @@ def select_preserved_tail_start(
     min_messages: int,
     max_chars: int,
 ) -> int:
+    """Pick the index where the preserved tail starts.
+
+    Renders each message to canonical (role, content) pairs in Python, then
+    delegates the backward-walk + budget arithmetic to the C++ helper. The
+    provider-supplied ``adjust_compaction_tail_start`` is applied on the way
+    back so paired tool-call/result messages stay together.
+    """
     if not messages:
         return 0
 
-    used_tokens = 0
-    kept = 0
-    start = len(messages)
+    role_and_json: list[tuple[str, str]] = []
+    for m in messages:
+        rendered = provider.format_message_for_display(m)
+        if rendered is None:
+            serialized = provider.serialize_message(m)
+            role = str(serialized.get("role") or "user").upper()
+            # Walk parts the same way render_message_for_compaction does; we
+            # only need a representative string for token sizing here.
+            pieces = []
+            for part in serialized.get("parts", []):
+                pt = part.get("type")
+                if pt == "text":
+                    pieces.append(part.get("text", ""))
+                elif pt == "function_call":
+                    pieces.append(
+                        f"[Tool Call: {part.get('name')}({json.dumps(part.get('args') or {}, sort_keys=True)})]"
+                    )
+                elif pt == "function_response":
+                    pieces.append(
+                        f"[Tool Response: {part.get('name')} -> {json.dumps(part.get('response'), sort_keys=True)}]"
+                    )
+                elif pt == "thought":
+                    pieces.append(part.get("thought", ""))
+            content = "\n".join(p for p in pieces if p)
+        else:
+            role = str(rendered.get("role") or "user").upper()
+            content = str(rendered.get("content") or "")
+        role_and_json.append((role, content))
 
-    while start > 0:
-        message = messages[start - 1]
-        msg_tokens = approximate_tokens(
-            render_message_for_compaction(provider, message, max_chars=max_chars)
-        )
-        if kept >= min_messages and used_tokens + msg_tokens > tail_token_budget:
-            break
-        start -= 1
-        kept += 1
-        used_tokens += msg_tokens
+    start = _native.select_preserved_tail_start(
+        role_and_json, tail_token_budget, min_messages, max_chars
+    )
 
     adjust_start = getattr(provider, "adjust_compaction_tail_start", None)
     if adjust_start is not None:
@@ -145,21 +183,5 @@ def select_preserved_tail_start(
 
 
 def trimmed_transcript_lines(lines: list[str], *, max_chars: int) -> list[str]:
-    total_chars = sum(len(line) for line in lines)
-    if total_chars <= max_chars:
-        return lines
-
-    head = lines[:3]
-    used = sum(len(line) for line in head)
-    tail: list[str] = []
-    for line in reversed(lines[3:]):
-        if used + len(line) + 128 > max_chars:
-            break
-        tail.append(line)
-        used += len(line)
-
-    omitted = max(0, len(lines) - len(head) - len(tail))
-    middle = []
-    if omitted:
-        middle.append(f"[... {omitted} earlier messages omitted from compaction input ...]")
-    return [*head, *middle, *reversed(tail)]
+    """Trim a transcript to fit *max_chars* — delegated to the C++ helper."""
+    return list(_native.trimmed_transcript_lines(lines, max_chars))

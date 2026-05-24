@@ -169,6 +169,30 @@ def make_multi_tool_call_response(calls: list[tuple[str, dict]]) -> MockResponse
 # --- Fixtures ---
 
 
+@pytest.fixture(autouse=True)
+def _isolate_native_registry():
+    """Drop every resident session and cache slot before and after each test.
+
+    The C++ registry and cache manager are process-wide singletons, so state
+    from one test would otherwise leak into the next. We clear at the *start*
+    so tests aren't sensitive to ordering, and at the *end* so we don't leave
+    junk for other interpreters that share this venv. SQLite rows are not
+    touched — each persistence test uses its own tmp_path.
+    """
+    try:
+        from agent_core import _native
+    except ImportError:
+        yield
+        return
+    _native.registry.clear()
+    _native.cache_manager.clear_slots()
+    try:
+        yield
+    finally:
+        _native.registry.clear()
+        _native.cache_manager.clear_slots()
+
+
 @pytest.fixture
 def mock_env():
     """Set required environment variables."""

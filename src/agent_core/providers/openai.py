@@ -33,6 +33,8 @@ from urllib.parse import urlparse
 
 from agent_core.core.attachments import format_attachment_placeholder
 from agent_core.providers.types import (
+    CanonicalMessage,
+    CanonicalRole,
     FilePart,
     FileOutputPart,
     ParsedResponse,
@@ -161,6 +163,19 @@ class _StreamedOpenAIResponse:
         self.choices = [SimpleNamespace(message=message)]
         self.usage = usage
         self._agent_core_streamed_text = streamed_text
+
+
+def _canonical_role_for_openai(serialized: dict) -> CanonicalRole:
+    """Map a serialized OpenAI message to a canonical role.
+
+    OpenAI's roles already use the canonical set (``system``/``user``/
+    ``assistant``/``tool``); any unrecognized value falls back to ``"user"``
+    to keep history valid.
+    """
+    role = serialized.get("role", "user")
+    if role in ("user", "assistant", "tool", "system"):
+        return role  # type: ignore[return-value]
+    return "user"
 
 
 class OpenAIProvider:
@@ -646,6 +661,45 @@ class OpenAIProvider:
         d = dict(data)
         d.pop("_provider", None)
         return d
+
+    # ------------------------------------------------------------------
+    # Canonical form
+    # ------------------------------------------------------------------
+
+    PROVIDER_TAG = "openai"
+
+    def to_canonical(self, message: Any) -> CanonicalMessage:
+        """Serialize an OpenAI dict message to provider-neutral form."""
+        import json
+
+        serialized = self.serialize_message(message)
+        canonical_json = json.dumps(serialized, ensure_ascii=True, sort_keys=True)
+        return CanonicalMessage(
+            role=_canonical_role_for_openai(serialized),
+            provider_tag=self.PROVIDER_TAG,
+            canonical_json=canonical_json,
+            approx_tokens=max(1, (len(canonical_json) + 3) // 4),
+            provider_native=message,
+        )
+
+    def from_canonical(self, message: CanonicalMessage) -> Any:
+        """Reconstruct an OpenAI dict message from canonical form."""
+        import json
+
+        if message.provider_native is not None:
+            return message.provider_native
+        if message.provider_tag != self.PROVIDER_TAG:
+            raise ValueError(
+                f"Cannot reconstruct OpenAI message from provider "
+                f"{message.provider_tag!r}"
+            )
+        return self.deserialize_message(json.loads(message.canonical_json))
+
+    @staticmethod
+    def approx_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return max(1, (len(text) + 3) // 4)
 
     def format_message_for_display(self, message: Any) -> dict | None:
         if not isinstance(message, dict):

@@ -1,5 +1,23 @@
 """Agent Core - Extensible agent orchestration framework with multi-LLM support."""
 
+import atexit as _atexit
+
+from agent_core import _native as _native_ext
+
+
+# Tear down the C++ subsystems (Registry reaper, SQLite writer) while the
+# Python interpreter is still in a healthy state. Without this, static-local
+# destructors fire after Python's shutdown which can segfault when SessionHandle
+# destructors call back into the registry.
+@_atexit.register
+def _shutdown_native_extension() -> None:  # pragma: no cover — atexit-only
+    try:
+        _native_ext._shutdown()
+    except Exception:
+        pass
+
+
+from agent_core import registry
 from agent_core.agents.base import Agent, agent_as_tool, generate_instance_id
 from agent_core.agents.compaction import CompactionConfig
 from agent_core.core.events import (
@@ -12,6 +30,8 @@ from agent_core.core.events import (
 )
 from agent_core.providers import (
     AgentResponse,
+    CanonicalMessage,
+    CanonicalRole,
     FilePart,
     FileOutputPart,
     LLMProvider,
@@ -39,6 +59,8 @@ __all__ = [
     # Providers
     "LLMProvider",
     "AgentResponse",
+    "CanonicalMessage",
+    "CanonicalRole",
     "FilePart",
     "FileOutputPart",
     "GeminiProvider",
@@ -61,6 +83,8 @@ __all__ = [
     "EventBus",
     "get_event_bus",
     "emit_event",
+    # Registry
+    "registry",
 ]
 
 # Conditional import — openai is an optional dependency

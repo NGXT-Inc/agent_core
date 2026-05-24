@@ -1,43 +1,45 @@
-"""Centralized Vertex AI context cache management for agent conversations.
+"""Vertex AI context cache management — Python facade over the C++ manager.
 
-Manages per-agent cache slots from a shared executor pool. Each agent
-registers a slot, and the registry handles background cache creation,
-auto-promotion, TTL enforcement, and guaranteed cleanup of remote caches.
+The state machine (slot table, fingerprinting, TTL, pending-future tracking,
+background workers, reaper) lives in C++ via
+``agent_core._native.cache_manager``. This module keeps a backwards-compatible
+``ContextCacheRegistry`` class so existing call sites — including Papyrus —
+keep working unchanged. The Python side is responsible only for translating
+between provider callables / content lists and the opaque payload that the
+create callback understands.
 
-Every generate_content call should query get_advice() for the best
-available cache. The registry auto-promotes pending caches on every
-query, so callers never need to manage cache state manually.
-
-This module is internal to agent_core. Developers using the package
-interact with it indirectly through Agent.init_cache_registry().
+Phase 4 migration notes:
+    * ``ContextCacheRegistry`` is now a thin wrapper; instances no longer hold
+      slot dictionaries directly. Tests that inspected internal state should
+      switch to ``registry.peek_slot(agent_id)``.
+    * ``_compute_fingerprint`` continues to compute the same 16-hex-char hash,
+      now delegating to the C++ implementation so Python and C++ never disagree.
+    * The dataclasses ``CacheAdvice`` and ``_CacheSlot`` are kept as Python
+      types for callers that import them by name; the runtime state of an
+      agent's slot is, however, mastered in C++.
 """
 
+from __future__ import annotations
+
 import dataclasses
-import hashlib
 import logging
 import threading
-import time
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from typing import Callable
+from typing import Any, Callable
 
 from google import genai
 from google.genai import types
 
+from agent_core import _native
+
 logger = logging.getLogger(__name__)
 
-# Minimum new (uncached) tokens before considering a new cache creation.
+# Public constant retained from the previous Python implementation.
 MIN_TOKEN_GROWTH = 4096
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CacheAdvice:
-    """Returned by get_advice() to tell the caller what config to use.
-
-    If cache_name is None, use the normal base config (with system_instruction
-    and tools) and send all contents. If cache_name is set, build a config
-    with cached_content=cache_name (no system_instruction or tools) and send
-    only contents[contents_offset:].
-    """
+    """Returned by ``get_advice`` to tell the caller what config to use."""
 
     cache_name: str | None
     contents_offset: int
@@ -45,31 +47,46 @@ class CacheAdvice:
 
 @dataclasses.dataclass
 class _CacheSlot:
-    """Per-agent cache state managed by the registry."""
+    """Backwards-compatible dataclass.
+
+    The real state lives in C++; this dataclass is only used by code that
+    held references to it before the migration. Its fields mirror those in
+    the native ``CacheSlotSnapshot``.
+    """
 
     model_name: str
     min_token_threshold: int
-
-    # Ready cache (currently usable)
     ready_name: str | None = None
     ready_offset: int = 0
-    ready_created_at: float | None = None  # time.monotonic()
-
-    # Pending cache (being created in background)
-    pending: Future | None = None
+    ready_created_at: float | None = None
+    pending: Any = None
     pending_through_index: int | None = None
-
-    # Tracking for cache creation decisions
     last_cache_token_count: int = 0
     config_fingerprint: str | None = None
 
 
-class ContextCacheRegistry:
-    """Singleton registry managing Vertex AI context caches for all agents.
+def _compute_fingerprint(
+    system_instruction: str | None, tools: list[Callable] | None
+) -> str:
+    """Compute the cache-config fingerprint exactly as the C++ side does."""
+    tool_names = (
+        [getattr(f, "__name__", str(f)) for f in tools] if tools else []
+    )
+    return _native.compute_cache_fingerprint(
+        system_instruction or "", tool_names
+    )
 
-    Provides a shared executor pool and per-agent cache slots with
-    automatic promotion, TTL enforcement, and guaranteed cleanup.
+
+class ContextCacheRegistry:
+    """Process-wide Vertex AI cache registry — facade over the C++ manager.
+
+    Multiple instances can be constructed, but they all share the same
+    underlying global state (the C++ ``CacheManager`` is a singleton). The
+    last-configured ``client`` / ``ttl`` wins, which matches the previous
+    behavior where applications constructed exactly one registry at startup.
     """
+
+    _configured_lock = threading.Lock()
 
     def __init__(
         self,
@@ -79,26 +96,22 @@ class ContextCacheRegistry:
     ) -> None:
         self._client = client
         self._cache_ttl = cache_ttl_seconds
-        # API-side TTL: our TTL + 60s safety buffer
-        self._api_ttl = f"{cache_ttl_seconds + 60}s"
-
-        self._lock = threading.Lock()
-        self._slots: dict[str, _CacheSlot] = {}
+        # Capture model names per agent so we can construct the right Vertex
+        # config when the create callback fires.
+        self._tool_callables_by_agent: dict[str, list[Callable]] = {}
+        self._payload_lock = threading.Lock()
         self._closed = False
 
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="cache-registry"
-        )
-
-        # Background reaper cleans up expired caches from idle agents
-        self._reaper_stop = threading.Event()
-        self._reaper_thread = threading.Thread(
-            target=self._reaper_loop, daemon=True, name="cache-reaper"
-        )
-        self._reaper_thread.start()
+        with ContextCacheRegistry._configured_lock:
+            _native.cache_manager.configure(
+                self._create_remote_cache,
+                self._delete_remote_cache,
+                max_workers,
+                cache_ttl_seconds,
+            )
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public surface
     # ------------------------------------------------------------------
 
     def register(
@@ -107,33 +120,14 @@ class ContextCacheRegistry:
         model_name: str,
         min_token_threshold: int = 32_768,
     ) -> None:
-        """Register an agent slot. Called once during agent init."""
-        with self._lock:
-            if agent_id in self._slots:
-                logger.warning("Agent %s already registered, re-registering", agent_id)
-                old_slot = self._slots[agent_id]
-                names = self._collect_cache_names(old_slot)
-                for name in names:
-                    self._delete_cache(name)
-            self._slots[agent_id] = _CacheSlot(
-                model_name=model_name,
-                min_token_threshold=min_token_threshold,
-            )
-            logger.debug("Registered cache slot for %s", agent_id)
+        _native.cache_manager.register_agent(
+            agent_id, model_name, min_token_threshold
+        )
 
     def unregister(self, agent_id: str) -> None:
-        """Remove agent slot and delete its remote caches."""
-        with self._lock:
-            slot = self._slots.pop(agent_id, None)
-        if slot is None:
-            return
-
-        # Collect names outside lock — may block waiting for pending futures
-        names_to_delete = self._collect_cache_names(slot, wait_for_pending=True)
-
-        for name in names_to_delete:
-            self._delete_cache(name)
-        logger.debug("Unregistered cache slot for %s", agent_id)
+        _native.cache_manager.unregister_agent(agent_id)
+        with self._payload_lock:
+            self._tool_callables_by_agent.pop(agent_id, None)
 
     def get_advice(
         self,
@@ -143,68 +137,15 @@ class ContextCacheRegistry:
         wait: bool = False,
         wait_timeout: float = 30.0,
     ) -> CacheAdvice:
-        """Return the best available cache for this agent.
-
-        Auto-promotes pending caches and validates config on every call.
-
-        Args:
-            agent_id: The agent to get advice for.
-            system_instruction: Current system prompt (for config drift check).
-            tools: Current tool list (for config drift check).
-            wait: If True and a cache creation is pending, block until it
-                completes (up to wait_timeout seconds) before returning.
-                Useful when the caller wants to guarantee a cache hit.
-            wait_timeout: Maximum seconds to wait for a pending cache.
-                Only used when wait=True. Defaults to 30s.
-        """
-        no_cache = CacheAdvice(cache_name=None, contents_offset=0)
-        old_name: str | None = None
-
-        # If wait=True, block for the pending future outside the lock
-        if wait:
-            pending = None
-            with self._lock:
-                slot = self._slots.get(agent_id)
-                if slot is not None and slot.pending is not None and not slot.pending.done():
-                    pending = slot.pending
-            if pending is not None:
-                try:
-                    pending.result(timeout=wait_timeout)
-                except Exception:
-                    pass  # Promotion will handle the failure
-
-        with self._lock:
-            slot = self._slots.get(agent_id)
-            if slot is None:
-                return no_cache
-
-            self._try_promote(slot)
-
-            if slot.ready_name is None:
-                return no_cache
-
-            # Invalidate on TTL expiry or config drift
-            if self._is_expired(slot):
-                old_name = slot.ready_name
-                self._clear_ready(slot)
-            elif slot.config_fingerprint is not None:
-                current_fp = _compute_fingerprint(system_instruction, tools)
-                if current_fp != slot.config_fingerprint:
-                    logger.warning(
-                        "Cache invalidated for %s: config drift", agent_id
-                    )
-                    old_name = slot.ready_name
-                    self._reset_slot_locked(slot)
-
-            if old_name is None:
-                return CacheAdvice(
-                    cache_name=slot.ready_name,
-                    contents_offset=slot.ready_offset,
-                )
-
-        # Delete stale cache outside lock
-        self._delete_cache(old_name)
-        return no_cache
+        fp = _compute_fingerprint(system_instruction, tools)
+        native_advice = _native.cache_manager.get_advice(
+            agent_id, fp, wait, wait_timeout
+        )
+        cache_name = native_advice.cache_name or None
+        return CacheAdvice(
+            cache_name=cache_name,
+            contents_offset=native_advice.contents_offset if cache_name else 0,
+        )
 
     def notify(
         self,
@@ -214,166 +155,145 @@ class ContextCacheRegistry:
         tools: list[Callable] | None,
         token_count: int | None = None,
     ) -> None:
-        """Notify that an agent's history has changed.
-
-        Attempts promotion, then fires a new cache creation if thresholds
-        are met. Called after generate_content rounds and after tool
-        results are appended.
-        """
-        # Resolve token count outside the lock to avoid blocking I/O
+        if self._closed:
+            return
+        # Resolve the token count via the client API if the caller didn't
+        # already supply one — same fallback the old code had.
+        snapshot = self._peek_slot(agent_id)
+        if snapshot is None:
+            # Unregistered agent — match the old code's no-op behavior.
+            return
         if token_count is None:
-            model_name = None
-            with self._lock:
-                slot = self._slots.get(agent_id)
-                if slot is not None:
-                    model_name = slot.model_name
-            if model_name is None:
-                return
             try:
-                response = self._client.models.count_tokens(
-                    model=model_name, contents=contents
+                resp = self._client.models.count_tokens(
+                    model=snapshot.model_name, contents=contents
                 )
-                token_count = response.total_tokens
-            except Exception as e:
-                logger.debug("Token counting failed, skipping cache: %s", e)
+                token_count = resp.total_tokens
+            except Exception as exc:
+                logger.debug("Token counting failed, skipping cache: %s", exc)
                 return
 
-        with self._lock:
-            if self._closed:
-                return
-            slot = self._slots.get(agent_id)
-            if slot is None:
-                return
+        fp = _compute_fingerprint(system_instruction, tools)
 
-            self._try_promote(slot)
+        # Stash the tool callables so the worker can rebuild the Vertex config
+        # later — the C++ payload only carries the contents list and system
+        # prompt by value.
+        with self._payload_lock:
+            self._tool_callables_by_agent[agent_id] = list(tools) if tools else []
 
-            if not self._should_cache(slot, token_count):
-                return
-
-            self._fire_creation(
-                slot=slot,
-                agent_id=agent_id,
-                contents=list(contents),
-                system_instruction=system_instruction,
-                tools=tools,
-                token_count=token_count,
-            )
+        payload = {
+            "agent_id": agent_id,
+            "model": self._lookup_model_name(agent_id),
+            "contents": list(contents),
+            "system_instruction": system_instruction,
+            "ttl": f"{self._cache_ttl + 60}s",
+        }
+        _native.cache_manager.notify(
+            agent_id, fp, int(token_count), len(contents), payload
+        )
 
     def invalidate(self, agent_id: str) -> None:
-        """Clear an agent's cache state. Called on config drift, history
-        clear, or tool registration."""
-        names_to_delete: list[str] = []
-        with self._lock:
-            slot = self._slots.get(agent_id)
-            if slot is None:
-                return
-            names_to_delete = self._collect_cache_names(slot)
-            self._reset_slot_locked(slot)
-
-        for name in names_to_delete:
-            self._delete_cache(name)
+        _native.cache_manager.invalidate(agent_id)
 
     def close(self) -> None:
-        """Shutdown: delete all remote caches, stop executor and reaper."""
-        self._reaper_stop.set()
+        """Tear down this facade.
 
-        with self._lock:
-            self._closed = True
-            slots = list(self._slots.values())
-            self._slots.clear()
-
-        # Collect names outside lock — may block waiting for pending futures
-        all_names: list[str] = []
-        for slot in slots:
-            all_names.extend(self._collect_cache_names(slot, wait_for_pending=True))
-
-        for name in all_names:
-            self._delete_cache(name)
-
-        self._executor.shutdown(wait=False)
-        self._reaper_thread.join(timeout=2)
-        logger.debug("ContextCacheRegistry closed")
+        The C++ cache manager is process-global; we don't stop its workers
+        here (the module's atexit handler does). We just drop our reference
+        to per-agent payload state and mark this facade as closed.
+        """
+        self._closed = True
+        with self._payload_lock:
+            self._tool_callables_by_agent.clear()
 
     # ------------------------------------------------------------------
-    # Internal: promotion
+    # Introspection helpers (mostly for tests)
     # ------------------------------------------------------------------
 
-    def _try_promote(self, slot: _CacheSlot) -> bool:
-        """Promote pending -> ready if done. Must be called with _lock held.
-        Returns True if promoted."""
-        if slot.pending is None or not slot.pending.done():
-            return False
+    def peek_slot(self, agent_id: str):
+        """Return a snapshot of the slot, or ``None`` if not registered.
 
-        old_name = slot.ready_name
-        promoted = False
-        try:
-            new_name = slot.pending.result(timeout=0)
-            slot.ready_name = new_name
-            slot.ready_offset = slot.pending_through_index or 0
-            slot.ready_created_at = time.monotonic()
-            promoted = True
-            logger.debug(
-                "Cache promoted: %s (covers %d items)", new_name, slot.ready_offset
+        The returned object is a ``_native.CacheSlotSnapshot`` — a frozen view
+        with these read-only attributes:
+
+        * ``model_name`` / ``min_token_threshold``
+        * ``has_ready`` / ``ready_name`` / ``ready_offset`` / ``ready_expired``
+        * ``pending`` (bool) / ``pending_through_index``
+        * ``last_cache_token_count`` / ``config_fingerprint``
+        """
+        return _native.cache_manager.peek_slot(agent_id)
+
+    def seed_slot(
+        self,
+        agent_id: str,
+        *,
+        ready_name: str = "",
+        ready_offset: int = 0,
+        ready_expired: bool = False,
+        pending_done: bool = False,
+        pending_cache_name: str = "",
+        pending_through_index: int = 0,
+        last_cache_token_count: int = 0,
+        config_fingerprint: str = "",
+    ) -> None:
+        """Force a slot into a particular state — test helper."""
+        _native.cache_manager.seed_slot(
+            agent_id,
+            ready_name,
+            ready_offset,
+            ready_expired,
+            pending_done,
+            pending_cache_name,
+            pending_through_index,
+            last_cache_token_count,
+            config_fingerprint,
+        )
+
+    def _peek_slot(self, agent_id: str) -> Any:
+        return _native.cache_manager.peek_slot(agent_id)
+
+    def _lookup_model_name(self, agent_id: str) -> str:
+        snap = _native.cache_manager.peek_slot(agent_id)
+        if snap is None:
+            raise RuntimeError(
+                f"cache notify for unregistered agent {agent_id}"
             )
-        except Exception as e:
-            logger.warning("Cache creation failed: %s", e)
-
-        slot.pending = None
-        slot.pending_through_index = None
-
-        # Schedule old cache deletion outside lock via executor
-        if old_name:
-            self._executor.submit(self._delete_cache, old_name)
-
-        return promoted
+        return snap.model_name
 
     # ------------------------------------------------------------------
-    # Internal: TTL
+    # Callbacks invoked from C++ workers
     # ------------------------------------------------------------------
 
-    def _is_expired(self, slot: _CacheSlot) -> bool:
-        """Check if the ready cache has exceeded TTL."""
-        if slot.ready_created_at is None:
-            return False
-        return (time.monotonic() - slot.ready_created_at) >= self._cache_ttl
+    def _create_remote_cache(self, payload: dict) -> str:
+        """Worker callback — turns the opaque payload into a Vertex API call."""
+        try:
+            agent_id = payload["agent_id"]
+            with self._payload_lock:
+                tools = self._tool_callables_by_agent.get(agent_id, [])
+            converted_tools = self._convert_tools(tools) if tools else None
+            cache = self._client.caches.create(
+                model=payload["model"],
+                config=types.CreateCachedContentConfig(
+                    contents=payload["contents"],
+                    system_instruction=payload["system_instruction"],
+                    tools=converted_tools,
+                    ttl=payload["ttl"],
+                ),
+            )
+            logger.debug("Cache created for %s: %s", agent_id, cache.name)
+            return cache.name or ""
+        except Exception as exc:
+            logger.warning("Cache creation failed: %s", exc)
+            return ""
 
-    def _reaper_loop(self) -> None:
-        """Background thread that cleans up expired caches every 60s."""
-        while not self._reaper_stop.wait(timeout=60):
-            expired_names: list[str] = []
-            with self._lock:
-                for agent_id, slot in self._slots.items():
-                    if slot.ready_name and self._is_expired(slot):
-                        logger.debug(
-                            "Reaper: expiring cache for %s", agent_id
-                        )
-                        expired_names.append(slot.ready_name)
-                        self._clear_ready(slot)
-
-            for name in expired_names:
-                self._delete_cache(name)
-
-    # ------------------------------------------------------------------
-    # Internal: cache creation decisions
-    # ------------------------------------------------------------------
-
-    def _should_cache(self, slot: _CacheSlot, token_count: int) -> bool:
-        """Check if a new cache creation is warranted.
-        token_count must already be resolved. Must be called with _lock held."""
-        if slot.pending is not None:
-            return False
-
-        if token_count < slot.min_token_threshold:
-            return False
-
-        delta = token_count - slot.last_cache_token_count
-        if slot.last_cache_token_count > 0 and delta < MIN_TOKEN_GROWTH:
-            return False
-
-        return True
+    def _delete_remote_cache(self, cache_name: str) -> None:
+        try:
+            self._client.caches.delete(name=cache_name)
+            logger.debug("Cache deleted: %s", cache_name)
+        except Exception as exc:
+            logger.debug("Cache deletion failed (API TTL will handle): %s", exc)
 
     def _convert_tools(self, tools: list[Callable]) -> list[types.Tool]:
-        """Convert Python callables to Tool declarations for the caching API."""
         declarations = [
             types.FunctionDeclaration.from_callable(
                 callable=f, client=self._client._api_client
@@ -381,133 +301,3 @@ class ContextCacheRegistry:
             for f in tools
         ]
         return [types.Tool(function_declarations=declarations)]
-
-    def _fire_creation(
-        self,
-        slot: _CacheSlot,
-        agent_id: str,
-        contents: list[types.Content],
-        system_instruction: str | None,
-        tools: list[Callable] | None,
-        token_count: int,
-    ) -> None:
-        """Submit background cache creation. Must be called with _lock held."""
-        slot.pending_through_index = len(contents)
-        slot.last_cache_token_count = token_count
-        slot.config_fingerprint = _compute_fingerprint(system_instruction, tools)
-
-        model_name = slot.model_name
-        api_ttl = self._api_ttl
-        client = self._client
-        # Convert tools upfront (fast, in-memory) so the background
-        # thread sends serialized declarations, not raw callables.
-        converted_tools = self._convert_tools(tools) if tools else None
-
-        def _create() -> str:
-            cache = client.caches.create(
-                model=model_name,
-                config=types.CreateCachedContentConfig(
-                    contents=contents,
-                    system_instruction=system_instruction,
-                    tools=converted_tools,
-                    ttl=api_ttl,
-                ),
-            )
-            logger.debug("Cache created for %s: %s", agent_id, cache.name)
-            return cache.name
-
-        slot.pending = self._executor.submit(_create)
-
-    # ------------------------------------------------------------------
-    # Internal: slot cleanup helpers
-    # ------------------------------------------------------------------
-
-    def _collect_cache_names(
-        self, slot: _CacheSlot, wait_for_pending: bool = False
-    ) -> list[str]:
-        """Collect cache names from a slot for deletion.
-
-        Args:
-            slot: The cache slot to drain. Must already be removed from
-                ``_slots`` so no other thread can reference it.
-            wait_for_pending: If True, wait up to 5s for an in-flight
-                pending future so we can delete the resulting cache.
-                If False, just cancel it.
-
-        Note: When ``wait_for_pending=True`` this method may block.
-        Call outside ``_lock`` to avoid stalling other registry operations.
-        """
-        names: list[str] = []
-        if slot.pending is not None:
-            pending = slot.pending
-            if pending.done():
-                try:
-                    names.append(pending.result(timeout=0))
-                except Exception:
-                    pass
-            else:
-                cancelled = pending.cancel()
-                if wait_for_pending:
-                    try:
-                        names.append(pending.result(timeout=5))
-                    except FutureTimeoutError:
-                        if not pending.cancelled():
-                            self._delete_future_cache_when_done(pending)
-                    except Exception:
-                        pass
-                elif not cancelled:
-                    self._delete_future_cache_when_done(pending)
-        if slot.ready_name:
-            names.append(slot.ready_name)
-        return names
-
-    def _delete_future_cache_when_done(self, future: Future) -> None:
-        """Delete a remote cache created by a future we no longer track."""
-        def _cleanup(done_future: Future) -> None:
-            try:
-                name = done_future.result(timeout=0)
-            except Exception:
-                return
-            if name:
-                self._delete_cache(name)
-
-        future.add_done_callback(_cleanup)
-
-    @staticmethod
-    def _clear_ready(slot: _CacheSlot) -> None:
-        """Clear the ready cache fields on a slot."""
-        slot.ready_name = None
-        slot.ready_offset = 0
-        slot.ready_created_at = None
-
-    def _reset_slot_locked(self, slot: _CacheSlot) -> None:
-        """Reset a slot's entire cache state without removing it from the registry.
-        Must be called with _lock held."""
-        self._clear_ready(slot)
-        slot.pending = None
-        slot.pending_through_index = None
-        slot.last_cache_token_count = 0
-        slot.config_fingerprint = None
-
-    def _delete_cache(self, name: str) -> None:
-        """Best-effort remote cache deletion."""
-        try:
-            self._client.caches.delete(name=name)
-            logger.debug("Cache deleted: %s", name)
-        except Exception as e:
-            logger.debug("Cache deletion failed (API TTL will handle): %s", e)
-
-
-# ------------------------------------------------------------------
-# Module-level helpers
-# ------------------------------------------------------------------
-
-
-def _compute_fingerprint(
-    system_instruction: str | None, tools: list[Callable] | None
-) -> str:
-    """Hash system_instruction + tool names to detect config drift."""
-    parts = [system_instruction or ""]
-    if tools:
-        parts.extend(getattr(f, "__name__", str(f)) for f in tools)
-    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]

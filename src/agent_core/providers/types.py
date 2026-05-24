@@ -14,9 +14,12 @@ import base64
 import mimetypes
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Callable, Literal, Protocol, TypeAlias, runtime_checkable
 
 from agent_core.core.attachments import format_attachment_placeholder
+
+
+CanonicalRole: TypeAlias = Literal["user", "assistant", "tool", "system"]
 
 
 class UnsupportedInputPart(ValueError):
@@ -354,6 +357,34 @@ class TokenUsage:
     cache_write_tokens: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalMessage:
+    """Provider-neutral view of one history message, ready for the C++ store.
+
+    Carries three things in lock-step:
+
+    - ``provider_native``: the SDK's actual message object — what we send back
+      to the provider on the next call. Opaque to anything but the originating
+      provider.
+    - ``canonical_json``: the JSON-safe serialized form, used for SQLite
+      persistence and for compaction transcript rendering. Stable across
+      reloads; never contains attachment bytes.
+    - ``approx_tokens``: cheap pre-computed token estimate
+      (``max(1, (len(canonical_json) + 3) // 4)``) suitable for compaction
+      triggers. Exact token counts come from ``provider.count_tokens`` when
+      needed.
+
+    Construction goes through ``LLMProvider.to_canonical``; reconstruction back
+    to a native message goes through ``LLMProvider.from_canonical``.
+    """
+
+    role: CanonicalRole
+    provider_tag: str
+    canonical_json: str
+    approx_tokens: int
+    provider_native: Any = field(repr=False, compare=False)
+
+
 @dataclass(slots=True)
 class ParsedResponse:
     """Provider-neutral view of a model response.
@@ -538,3 +569,37 @@ class LLMProvider(Protocol):
         Returns ``{"role": str, "content": str}`` or ``None`` to skip.
         """
         ...
+
+    # --- Canonical-form encoding (for the C++ history store) ---
+
+    def to_canonical(self, message: Any) -> CanonicalMessage:
+        """Encode a provider-native message into provider-neutral form.
+
+        Implementations should serialize the message exactly once via
+        ``serialize_message`` and re-use the result for ``canonical_json`` and
+        ``approx_tokens``. The returned ``CanonicalMessage`` keeps a reference
+        to *message* in ``provider_native`` so the agent loop can hand the
+        original back to ``generate`` without re-parsing.
+        """
+        ...
+
+    def from_canonical(self, message: CanonicalMessage) -> Any:
+        """Reconstruct a provider-native message from canonical form.
+
+        After a process restart the ``provider_native`` field is empty;
+        implementations should rebuild a usable native object from
+        ``canonical_json`` via ``deserialize_message``. When ``provider_native``
+        is populated (live in-process roundtrip) it may be returned directly.
+        """
+        ...
+
+    @staticmethod
+    def approx_tokens(text: str) -> int:
+        """Return a cheap token estimate for *text* — ``max(1, len/4)``.
+
+        Used to cache ``CanonicalMessage.approx_tokens`` at insertion time.
+        Providers may override for a tokenizer-accurate count if cheap.
+        """
+        if not text:
+            return 0
+        return max(1, (len(text) + 3) // 4)

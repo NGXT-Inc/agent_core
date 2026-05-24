@@ -6,6 +6,8 @@ agents to work with different LLM backends (Gemini, OpenAI, etc.).
 
 from agent_core.providers.types import (
     AgentResponse,
+    CanonicalMessage,
+    CanonicalRole,
     FilePart,
     FileOutputPart,
     LLMProvider,
@@ -26,6 +28,8 @@ from agent_core.providers.types import (
 __all__ = [
     "LLMProvider",
     "AgentResponse",
+    "CanonicalMessage",
+    "CanonicalRole",
     "FilePart",
     "FileOutputPart",
     "MessagePart",
