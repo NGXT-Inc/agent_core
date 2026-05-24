@@ -6,22 +6,48 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+DEFAULT_TRIGGER_RATIO_NUMERATOR = 4
+DEFAULT_TRIGGER_RATIO_DENOMINATOR = 5
+
 
 @dataclass(frozen=True, slots=True)
 class CompactionConfig:
     """Policy for automatic context compaction."""
 
     enabled: bool = False
-    model_limit_tokens: int = 1_000_000
-    trigger_tokens: int = 800_000
-    target_tokens: int = 500_000
-    tail_token_budget: int = 120_000
+    model_limit_tokens: int = 256_000
+    trigger_tokens: int | None = None
+    target_tokens: int = 128_000
+    tail_token_budget: int = 64_000
     response_buffer_tokens: int = 32_768
     summary_max_output_tokens: int = 4096
     max_transcript_chars: int = 120_000
     max_message_chars: int = 12_000
     min_preserved_messages: int = 4
     max_compactions_per_run: int = 1
+
+    def _default_trigger_tokens(self) -> int:
+        return max(
+            1,
+            self.model_limit_tokens
+            * DEFAULT_TRIGGER_RATIO_NUMERATOR
+            // DEFAULT_TRIGGER_RATIO_DENOMINATOR,
+        )
+
+    def __post_init__(self) -> None:
+        if self.trigger_tokens is None:
+            object.__setattr__(self, "trigger_tokens", self._default_trigger_tokens())
+
+    def effective_trigger_tokens(self) -> int:
+        """Return the active auto-compaction threshold."""
+        trigger = self.trigger_tokens or self._default_trigger_tokens()
+        headroom_limit = max(1, self.model_limit_tokens - self.response_buffer_tokens)
+        return min(trigger, headroom_limit)
+
+    def effective_tail_token_budget(self, *, system_prompt_tokens: int = 0) -> int:
+        """Return the preserved-tail budget after applying the target context."""
+        target_tail_budget = max(1, self.target_tokens - max(0, system_prompt_tokens))
+        return min(self.tail_token_budget, target_tail_budget)
 
 
 def approximate_tokens(text: str) -> int:

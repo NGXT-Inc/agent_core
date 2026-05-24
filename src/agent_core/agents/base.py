@@ -146,6 +146,7 @@ class Agent:
         CODE_TOOLS: Tool names that handle code (for special result formatting).
         MAX_PARALLEL_TOOLS: Maximum concurrent tool executions.
         MAX_ITERATIONS: Maximum function calling loop iterations.
+        ENABLE_COMPACTION: Whether to compact large conversation history.
         emit_lifecycle_events: Whether to emit AGENT_START/END events.
         emit_tool_events: Whether to emit TOOL_START/END events.
 
@@ -190,7 +191,7 @@ class Agent:
     CACHE_MIN_TOKENS: ClassVar[int] = 32_768
 
     # Context compaction
-    ENABLE_COMPACTION: ClassVar[bool] = False
+    ENABLE_COMPACTION: ClassVar[bool] = True
 
     # Streaming
     DEFAULT_STREAMING: ClassVar[bool] = False
@@ -543,12 +544,14 @@ class Agent:
         )
         prompt = (
             f"Summarize the earlier conversation history for the `{self.name}` agent.\n"
-            "Focus on durable context that the next model call still needs:\n"
+            "Create a concise handoff summary for the same agent after older "
+            "conversation messages are removed. Preserve only durable context "
+            "that the next model call still needs:\n"
+            "- current progress and key decisions made\n"
             "- the user's active goal, constraints, and preferences\n"
-            "- important files, URLs, entities, and IDs already found\n"
-            "- tool results, decisions, and partial work that should not be repeated\n"
-            "- unresolved questions and the most likely next step\n"
-            "- anything in the preserved recent messages that depends on older context\n\n"
+            "- important files, URLs, entities, IDs, tool results, and examples\n"
+            "- remaining work, unresolved questions, and the most likely next step\n"
+            "- dependencies in the preserved recent messages that require older context\n\n"
             "Be concise but information-dense. Do not add preamble, meta commentary, or bullet"
             " numbering unless it helps clarity.\n\n"
             f"Older messages being summarized: {len(older_messages)}\n"
@@ -1002,6 +1005,108 @@ class Agent:
             self._provider, contents, max_chars=max_chars
         ) + approximate_tokens(self.system_prompt or "")
 
+    def _invalid_compaction_config_fields(self, config: CompactionConfig) -> list[str]:
+        invalid_fields = [
+            field
+            for field in (
+                "model_limit_tokens",
+                "target_tokens",
+                "tail_token_budget",
+                "response_buffer_tokens",
+                "summary_max_output_tokens",
+                "max_transcript_chars",
+                "max_message_chars",
+                "min_preserved_messages",
+                "max_compactions_per_run",
+            )
+            if getattr(config, field) <= 0
+        ]
+        if config.trigger_tokens is None or config.trigger_tokens <= 0:
+            invalid_fields.append("trigger_tokens")
+        if (
+            config.model_limit_tokens > 0
+            and config.response_buffer_tokens >= config.model_limit_tokens
+        ):
+            invalid_fields.append("response_buffer_tokens")
+        return invalid_fields
+
+    def _compaction_policy_details(
+        self,
+        config: CompactionConfig,
+        *,
+        effective_trigger_tokens: int,
+        effective_tail_token_budget: int,
+    ) -> dict:
+        return {
+            "model_limit_tokens": config.model_limit_tokens,
+            "trigger_tokens": config.trigger_tokens,
+            "effective_trigger_tokens": effective_trigger_tokens,
+            "target_tokens": config.target_tokens,
+            "tail_token_budget": config.tail_token_budget,
+            "effective_tail_token_budget": effective_tail_token_budget,
+            "response_buffer_tokens": config.response_buffer_tokens,
+            "summary_max_output_tokens": config.summary_max_output_tokens,
+            "min_preserved_messages": config.min_preserved_messages,
+            "max_compactions_per_run": config.max_compactions_per_run,
+        }
+
+    def _emit_compaction_event(
+        self,
+        status: EventStatus,
+        *,
+        compaction_id: str,
+        scope: str,
+        reason: str,
+        phase: str,
+        pre_tokens: int,
+        config: CompactionConfig,
+        effective_trigger_tokens: int,
+        effective_tail_token_budget: int,
+        history_items_before: int,
+        post_tokens: int | None = None,
+        history_items_after: int | None = None,
+        older_messages: int | None = None,
+        preserved_messages: int | None = None,
+        duration_ms: int | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        if not self.emit_lifecycle_events:
+            return
+        details = {
+            "compaction_id": compaction_id,
+            "scope": scope,
+            "reason": reason,
+            "phase": phase,
+            "pre_tokens": pre_tokens,
+            "history_items_before": history_items_before,
+            **self._compaction_policy_details(
+                config,
+                effective_trigger_tokens=effective_trigger_tokens,
+                effective_tail_token_budget=effective_tail_token_budget,
+            ),
+        }
+        if post_tokens is not None:
+            details["post_tokens"] = post_tokens
+        if history_items_after is not None:
+            details["history_items_after"] = history_items_after
+        if older_messages is not None:
+            details["older_messages"] = older_messages
+        if preserved_messages is not None:
+            details["preserved_messages"] = preserved_messages
+        if duration_ms is not None:
+            details["duration_ms"] = duration_ms
+        if error is not None:
+            details["error"] = str(error)
+        self._emit_event(
+            EventType.CONTEXT_COMPACTION,
+            agent=self.instance_id,
+            agent_type=self.name,
+            status=status,
+            parent_agent=self._parent_agent,
+            wave_id=self._wave_id,
+            details=details,
+        )
+
     def _transcript_lines_for_compaction(
         self, messages: list[Any], max_chars: int
     ) -> list[str]:
@@ -1061,22 +1166,13 @@ class Agent:
         contents: list[Any],
         *,
         save_history: bool,
+        reason: str = "context_limit",
+        phase: str = "pre_call",
     ) -> tuple[bool, TokenUsage]:
         config = self.get_compaction_config()
         if not config.enabled or self._compaction_count >= config.max_compactions_per_run:
             return False, TokenUsage()
-        invalid_fields = [
-            field
-            for field in (
-                "trigger_tokens",
-                "tail_token_budget",
-                "summary_max_output_tokens",
-                "max_transcript_chars",
-                "max_message_chars",
-                "max_compactions_per_run",
-            )
-            if getattr(config, field) <= 0
-        ]
+        invalid_fields = self._invalid_compaction_config_fields(config)
         if invalid_fields:
             logger.warning(
                 "Compaction disabled for agent %s: invalid config fields: %s",
@@ -1090,13 +1186,18 @@ class Agent:
         pre_tokens = self._count_context_tokens_for_compaction(
             contents, config.max_message_chars
         )
-        if not pre_tokens or pre_tokens < config.trigger_tokens:
+        system_prompt_tokens = approximate_tokens(self.system_prompt or "")
+        effective_trigger_tokens = config.effective_trigger_tokens()
+        effective_tail_token_budget = config.effective_tail_token_budget(
+            system_prompt_tokens=system_prompt_tokens,
+        )
+        if not pre_tokens or pre_tokens < effective_trigger_tokens:
             return False, TokenUsage()
 
         preserved_start = select_preserved_tail_start(
             self._provider,
             contents,
-            tail_token_budget=config.tail_token_budget,
+            tail_token_budget=effective_tail_token_budget,
             min_messages=config.min_preserved_messages,
             max_chars=config.max_message_chars,
         )
@@ -1118,6 +1219,18 @@ class Agent:
             scope=scope,
             pre_tokens=pre_tokens,
             config=config,
+            history_items_before=history_items_before,
+        )
+        self._emit_compaction_event(
+            EventStatus.RUNNING,
+            compaction_id=compaction_id,
+            scope=scope,
+            reason=reason,
+            phase=phase,
+            pre_tokens=pre_tokens,
+            config=config,
+            effective_trigger_tokens=effective_trigger_tokens,
+            effective_tail_token_budget=effective_tail_token_budget,
             history_items_before=history_items_before,
         )
 
@@ -1154,6 +1267,23 @@ class Agent:
                 contents=contents,
                 save_history=save_history,
             )
+            self._emit_compaction_event(
+                EventStatus.COMPLETED,
+                compaction_id=compaction_id,
+                scope=scope,
+                reason=reason,
+                phase=phase,
+                pre_tokens=pre_tokens,
+                post_tokens=post_tokens,
+                config=config,
+                effective_trigger_tokens=effective_trigger_tokens,
+                effective_tail_token_budget=effective_tail_token_budget,
+                history_items_before=history_items_before,
+                history_items_after=len(contents),
+                older_messages=len(older_messages),
+                preserved_messages=len(preserved_messages),
+                duration_ms=int((time.time() - started_at) * 1000),
+            )
             return True, usage
         except Exception as exc:
             logger.warning(
@@ -1171,6 +1301,20 @@ class Agent:
                 duration_ms=int((time.time() - started_at) * 1000),
                 contents=contents,
                 save_history=save_history,
+            )
+            self._emit_compaction_event(
+                EventStatus.FAILED,
+                compaction_id=compaction_id,
+                scope=scope,
+                reason=reason,
+                phase=phase,
+                pre_tokens=pre_tokens,
+                config=config,
+                effective_trigger_tokens=effective_trigger_tokens,
+                effective_tail_token_budget=effective_tail_token_budget,
+                history_items_before=history_items_before,
+                duration_ms=int((time.time() - started_at) * 1000),
+                error=exc,
             )
             return False, TokenUsage()
 
@@ -1359,6 +1503,8 @@ class Agent:
                 compacted, compaction_usage = self._maybe_compact_history(
                     contents,
                     save_history=save_history,
+                    reason="context_limit",
+                    phase="pre_call",
                 )
                 total.prompt_tokens += compaction_usage.prompt_tokens
                 total.completion_tokens += compaction_usage.completion_tokens
@@ -1395,6 +1541,8 @@ class Agent:
                     compacted, compaction_usage = self._maybe_compact_history(
                         contents,
                         save_history=save_history,
+                        reason="context_overflow",
+                        phase="retry",
                     )
                     total.prompt_tokens += compaction_usage.prompt_tokens
                     total.completion_tokens += compaction_usage.completion_tokens

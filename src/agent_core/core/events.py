@@ -35,6 +35,7 @@ class EventType(str, Enum):
     # Model activity (universal)
     MODEL_THINKING = "model_thinking"  # Intermediate text during tool-calling loop
     CONTEXT_UPDATE = "context_update"  # Context window token count update
+    CONTEXT_COMPACTION = "context_compaction"  # Conversation history compacted
 
     # Errors (universal)
     ERROR = "error"

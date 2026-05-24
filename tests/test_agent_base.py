@@ -1302,17 +1302,68 @@ class TestEventEmission:
 class TestCompaction:
     """Test automatic context compaction in the shared runtime."""
 
-    def test_enabled_default_compaction_config_is_safe(self, mock_env, mock_genai):
-        """ENABLE_COMPACTION=True should not trigger zero-token summaries."""
+    def test_compaction_config_derives_and_caps_effective_budgets(self):
+        """Default trigger should derive from model limit and respect headroom."""
+        from agent_core.agents.compaction import CompactionConfig
+
+        default_config = CompactionConfig(enabled=True)
+        assert default_config.model_limit_tokens == 256_000
+        assert default_config.trigger_tokens == 204_800
+        assert default_config.effective_trigger_tokens() == 204_800
+
+        config = CompactionConfig(
+            enabled=True,
+            model_limit_tokens=100,
+            response_buffer_tokens=30,
+            target_tokens=30,
+            tail_token_budget=50,
+        )
+
+        assert config.trigger_tokens == 80
+        assert config.effective_trigger_tokens() == 70
+        assert config.effective_tail_token_budget(system_prompt_tokens=10) == 20
+
+    def test_invalid_compaction_budget_disables_compaction(
+        self, mock_env, mock_genai, caplog
+    ):
+        """Invalid budget fields should skip compaction instead of compacting poorly."""
+        from agent_core.agents.base import Agent
+        from agent_core.agents.compaction import CompactionConfig
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.count_tokens.return_value = MockTokenCountResponse(95)
+        mock_client.models.generate_content.return_value = make_text_response("ok")
+
+        class InvalidCompactingAgent(Agent):
+            ENABLE_COMPACTION = True
+
+            def get_compaction_config(self):
+                return CompactionConfig(
+                    enabled=True,
+                    model_limit_tokens=100,
+                    response_buffer_tokens=100,
+                )
+
+        agent = InvalidCompactingAgent()
+        agent._history.append(agent._provider.build_user_message("Earlier context"))
+
+        with caplog.at_level("WARNING"):
+            result = agent.run("latest")
+
+        assert result == "ok"
+        assert mock_client.models.generate_content.call_count == 1
+        assert "invalid config fields" in caplog.text
+        agent.close()
+
+    def test_default_compaction_config_is_enabled_and_safe(self, mock_env, mock_genai):
+        """Default compaction should not trigger zero-token summaries."""
         from agent_core.agents.base import Agent
 
         mock_client = mock_genai.Client.return_value
         mock_client.models.generate_content.return_value = make_text_response("ok")
 
-        class DefaultCompactingAgent(Agent):
-            ENABLE_COMPACTION = True
-
-        agent = DefaultCompactingAgent()
+        agent = Agent()
+        assert agent.get_compaction_config().enabled is True
         agent._history.extend([
             agent._provider.build_user_message("u1"),
             MockContent(role="model", parts=[MockPart(text="m1")]),
@@ -1382,6 +1433,236 @@ class TestCompaction:
         summary_display = agent._provider.format_message_for_display(agent._history[0])
         assert summary_display is not None
         assert "Internal context compaction summary" in summary_display["content"]
+        agent.close()
+
+    def test_run_compaction_emits_context_compaction_events(self, mock_env, mock_genai):
+        """Successful compaction should publish running and completed lifecycle events."""
+        from agent_core.agents.base import Agent
+        from agent_core.agents.compaction import CompactionConfig
+        from agent_core.core.events import EventBus, EventStatus, EventType
+
+        mock_client = mock_genai.Client.return_value
+        token_counts = iter([
+            MockTokenCountResponse(80),
+            MockTokenCountResponse(20),
+            MockTokenCountResponse(20),
+        ])
+        mock_client.models.count_tokens.side_effect = lambda *args, **kwargs: next(token_counts)
+        mock_client.models.generate_content.side_effect = [
+            make_text_response("Compacted summary"),
+            make_text_response("done"),
+        ]
+
+        class CompactingAgent(Agent):
+            ENABLE_COMPACTION = True
+
+            def get_compaction_config(self):
+                return CompactionConfig(
+                    enabled=True,
+                    model_limit_tokens=100,
+                    trigger_tokens=50,
+                    target_tokens=30,
+                    tail_token_budget=1,
+                    response_buffer_tokens=20,
+                    summary_max_output_tokens=128,
+                    max_transcript_chars=4000,
+                    max_message_chars=1000,
+                    min_preserved_messages=1,
+                    max_compactions_per_run=2,
+                )
+
+        bus = EventBus()
+        agent = CompactingAgent(event_bus=bus)
+        agent._history.append(agent._provider.build_user_message("Earlier context"))
+
+        assert agent.run("Latest request") == "done"
+
+        compaction_events = [
+            event for event in bus.get_events()
+            if event.type == EventType.CONTEXT_COMPACTION
+        ]
+        assert [event.status for event in compaction_events] == [
+            EventStatus.RUNNING,
+            EventStatus.COMPLETED,
+        ]
+        completed = compaction_events[-1]
+        assert completed.details["reason"] == "context_limit"
+        assert completed.details["phase"] == "pre_call"
+        assert completed.details["pre_tokens"] == 80
+        assert completed.details["post_tokens"] == 20
+        assert completed.details["effective_trigger_tokens"] == 50
+        assert completed.details["effective_tail_token_budget"] == 1
+        assert completed.details["older_messages"] == 1
+        assert completed.details["preserved_messages"] == 1
+        agent.close()
+
+    def test_compaction_failure_emits_failed_event(self, mock_env, mock_genai):
+        """A failed summary call should be observable and should not abort the run."""
+        from agent_core.agents.base import Agent
+        from agent_core.agents.compaction import CompactionConfig
+        from agent_core.core.events import EventBus, EventStatus, EventType
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.count_tokens.return_value = MockTokenCountResponse(80)
+        mock_client.models.generate_content.side_effect = [
+            RuntimeError("summary failed"),
+            make_text_response("done"),
+        ]
+
+        class CompactingAgent(Agent):
+            ENABLE_COMPACTION = True
+
+            def get_compaction_config(self):
+                return CompactionConfig(
+                    enabled=True,
+                    model_limit_tokens=100,
+                    trigger_tokens=50,
+                    target_tokens=30,
+                    tail_token_budget=1,
+                    response_buffer_tokens=20,
+                    summary_max_output_tokens=128,
+                    max_transcript_chars=4000,
+                    max_message_chars=1000,
+                    min_preserved_messages=1,
+                    max_compactions_per_run=1,
+                )
+
+        bus = EventBus()
+        agent = CompactingAgent(event_bus=bus)
+        agent._history.append(agent._provider.build_user_message("Earlier context"))
+
+        assert agent.run("Latest request") == "done"
+
+        failed = [
+            event for event in bus.get_events()
+            if event.type == EventType.CONTEXT_COMPACTION
+            and event.status == EventStatus.FAILED
+        ]
+        assert len(failed) == 1
+        assert failed[0].details["reason"] == "context_limit"
+        assert failed[0].details["error"] == "summary failed"
+        agent.close()
+
+    def test_overflow_retry_compaction_is_labeled(self, mock_env, mock_genai):
+        """Overflow-triggered compaction should be distinguishable from threshold compaction."""
+        from agent_core.agents.base import Agent
+        from agent_core.agents.compaction import CompactionConfig
+        from agent_core.core.events import EventBus, EventStatus, EventType
+
+        mock_client = mock_genai.Client.return_value
+        token_counts = iter([
+            MockTokenCountResponse(20),
+            MockTokenCountResponse(80),
+            MockTokenCountResponse(20),
+        ])
+        mock_client.models.count_tokens.side_effect = lambda *args, **kwargs: next(token_counts)
+        mock_client.models.generate_content.side_effect = [
+            RuntimeError("context too large"),
+            make_text_response("Compacted summary"),
+            make_text_response("done"),
+        ]
+
+        class CompactingAgent(Agent):
+            ENABLE_COMPACTION = True
+
+            def get_compaction_config(self):
+                return CompactionConfig(
+                    enabled=True,
+                    model_limit_tokens=100,
+                    trigger_tokens=50,
+                    target_tokens=30,
+                    tail_token_budget=1,
+                    response_buffer_tokens=20,
+                    summary_max_output_tokens=128,
+                    max_transcript_chars=4000,
+                    max_message_chars=1000,
+                    min_preserved_messages=1,
+                    max_compactions_per_run=1,
+                )
+
+        bus = EventBus()
+        agent = CompactingAgent(event_bus=bus)
+        agent._history.append(agent._provider.build_user_message("Earlier context"))
+
+        assert agent.run("Latest request") == "done"
+
+        completed = [
+            event for event in bus.get_events()
+            if event.type == EventType.CONTEXT_COMPACTION
+            and event.status == EventStatus.COMPLETED
+        ]
+        assert len(completed) == 1
+        assert completed[0].details["reason"] == "context_overflow"
+        assert completed[0].details["phase"] == "retry"
+        agent.close()
+
+    def test_compaction_summary_excludes_system_prompt_and_tool_schemas(
+        self, mock_env, mock_genai
+    ):
+        """Only conversation history should be summarized during compaction."""
+        from agent_core.agents.base import Agent
+        from agent_core.agents.compaction import CompactionConfig
+
+        mock_client = mock_genai.Client.return_value
+        token_counts = iter([
+            MockTokenCountResponse(80),
+            MockTokenCountResponse(20),
+            MockTokenCountResponse(20),
+        ])
+        mock_client.models.count_tokens.side_effect = lambda *args, **kwargs: next(token_counts)
+        mock_client.models.generate_content.side_effect = [
+            make_text_response("Compacted summary"),
+            make_text_response("done"),
+        ]
+
+        class CapturingAgent(Agent):
+            ENABLE_COMPACTION = True
+            system_prompt = "SYSTEM_PROMPT_SECRET"
+
+            def __init__(self, *args, **kwargs):
+                self.compaction_kwargs = []
+                super().__init__(*args, **kwargs)
+
+            def get_compaction_config(self):
+                return CompactionConfig(
+                    enabled=True,
+                    model_limit_tokens=100,
+                    trigger_tokens=50,
+                    target_tokens=30,
+                    tail_token_budget=1,
+                    response_buffer_tokens=20,
+                    summary_max_output_tokens=128,
+                    max_transcript_chars=4000,
+                    max_message_chars=1000,
+                    min_preserved_messages=1,
+                    max_compactions_per_run=2,
+                )
+
+            def _generate_with_retry(self, **kwargs):
+                if kwargs.get("tool_schemas") is None and kwargs.get(
+                    "system_prompt", ""
+                ).startswith("You compact"):
+                    self.compaction_kwargs.append(kwargs)
+                return super()._generate_with_retry(**kwargs)
+
+        def schema_tool(query: str) -> str:
+            """TOOL_SCHEMA_SECRET."""
+            return query
+
+        agent = CapturingAgent()
+        agent.register_tool(schema_tool)
+        agent._history.append(agent._provider.build_user_message("Earlier context"))
+
+        assert agent.run("Latest request") == "done"
+
+        assert len(agent.compaction_kwargs) == 1
+        compaction_kwargs = agent.compaction_kwargs[0]
+        prompt_text = compaction_kwargs["messages"][0].parts[0].text
+        assert compaction_kwargs["system_prompt"] != agent.system_prompt
+        assert compaction_kwargs["tool_schemas"] is None
+        assert "SYSTEM_PROMPT_SECRET" not in prompt_text
+        assert "TOOL_SCHEMA_SECRET" not in prompt_text
+        assert "Earlier context" in prompt_text
         agent.close()
 
     def test_run_stateless_can_compact_mid_run(self, mock_env, mock_genai):

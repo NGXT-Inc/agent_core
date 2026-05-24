@@ -174,8 +174,24 @@ Override these in your agent subclass:
 | `MAX_PARALLEL_TOOLS` | `10` | Max concurrent tool executions |
 | `MAX_ITERATIONS` | `50` | Max function calling loop iterations |
 | `DEFAULT_STREAMING` | `False` | Use provider streaming by default |
+| `ENABLE_COMPACTION` | `True` | Automatically summarize old conversation history when context is large |
 | `emit_lifecycle_events` | `True` | Emit AGENT_START/END events |
 | `emit_tool_events` | `True` | Emit TOOL_START/END events |
+
+### Context Compaction
+
+Compaction is enabled by default. Set `ENABLE_COMPACTION = False` to disable it
+for an agent, or override `get_compaction_config()` to tune `CompactionConfig`.
+
+Compaction only summarizes conversation history. The agent's `system_prompt`
+and tool schemas are still sent in full on every model call. By default,
+automatic compaction assumes a 256K context window and starts near 200K
+tokens, capped by the configured response buffer. The preserved recent-message
+tail is capped by `tail_token_budget` and `target_tokens`.
+
+Successful compaction replaces history with a synthetic summary message plus
+the preserved recent tail, invalidates context cache state, and emits
+`CONTEXT_COMPACTION` lifecycle events.
 
 ### Lifecycle Hooks
 
@@ -252,6 +268,7 @@ agent = MyAgent(session_id="session123", conversation_store=store)
 | `TOOL_END` | Tool execution completes |
 | `MODEL_THINKING` | Intermediate reasoning text |
 | `CONTEXT_UPDATE` | Context window token count changed |
+| `CONTEXT_COMPACTION` | Conversation history compaction started, completed, or failed |
 | `ERROR` | Error occurred |
 
 ### Subscribing to Events
