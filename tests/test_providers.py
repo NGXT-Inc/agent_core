@@ -1371,3 +1371,74 @@ class TestProtocolCompliance:
     def test_openrouter_is_llm_provider(self):
         from agent_core.providers.openrouter import OpenRouterProvider
         assert issubclass(OpenRouterProvider, LLMProvider)
+
+
+# ============================================================
+# Gemini timeout + retry classification (the paper-read hang fix)
+# ============================================================
+
+
+class TestGeminiTimeoutAndRetry:
+    """A stalled Vertex call (e.g. ingesting a large PDF) must time out and be
+    retried, not hang forever or die silently."""
+
+    def _provider(self, **kw):
+        from agent_core.providers.gemini import GeminiProvider
+        return GeminiProvider(client=MagicMock(), **kw)
+
+    def test_generate_request_sets_per_request_timeout(self):
+        provider = self._provider(request_timeout_ms=90000)
+        _contents, config = provider._build_generate_request(
+            messages=[],
+            system_prompt="s",
+            temperature=0.5,
+            max_output_tokens=100,
+            tool_schemas=None,
+        )
+        assert config.http_options is not None
+        assert config.http_options.timeout == 90000
+
+    def test_timeout_also_set_on_cached_config(self):
+        provider = self._provider(request_timeout_ms=90000)
+        _contents, config = provider._build_generate_request(
+            messages=[1, 2, 3],
+            system_prompt=None,
+            temperature=0.5,
+            max_output_tokens=100,
+            cache_config={"cache_name": "c", "contents_offset": 1},
+        )
+        assert config.http_options.timeout == 90000
+
+    def test_default_timeout_from_env(self, monkeypatch):
+        # Default comes from the module constant when not passed explicitly.
+        from agent_core.providers import gemini
+        provider = gemini.GeminiProvider(client=MagicMock())
+        _c, config = provider._build_generate_request(
+            messages=[], system_prompt=None, temperature=0.0,
+            max_output_tokens=10, tool_schemas=None,
+        )
+        assert config.http_options.timeout == gemini._DEFAULT_REQUEST_TIMEOUT_MS
+
+    def test_retryable_covers_timeouts_5xx_and_429(self):
+        import httpx
+        from google.genai.errors import ClientError, ServerError
+        provider = self._provider()
+
+        # Retryable: stalls (the hang), server errors, rate limits.
+        assert provider.is_retryable_error(httpx.ReadTimeout("stall"))
+        assert provider.is_retryable_error(httpx.ConnectError("dropped"))
+        assert provider.is_retryable_error(
+            ServerError(503, {"error": {"message": "unavailable"}})
+        )
+        assert provider.is_retryable_error(
+            ClientError(429, {"error": {"message": "rate"}})
+        )
+
+    def test_non_retryable_client_and_value_errors(self):
+        from google.genai.errors import ClientError
+        provider = self._provider()
+        # A 400 is a real request error — retrying won't help.
+        assert not provider.is_retryable_error(
+            ClientError(400, {"error": {"message": "bad request"}})
+        )
+        assert not provider.is_retryable_error(ValueError("nope"))

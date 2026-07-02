@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from google import genai
 from google.genai import types
-from google.genai.errors import ClientError
+from google.genai.errors import ClientError, ServerError
 
 from agent_core.core.attachments import format_attachment_placeholder
 from agent_core.providers.types import (
@@ -33,6 +33,15 @@ from agent_core.providers.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Per-request timeout (milliseconds). Without it the google-genai client has no
+# timeout, so a stalled Vertex response — most often while the model ingests a
+# large multimodal payload such as a PDF — hangs the generate/stream call
+# forever, silently stalling the turn with no error and no recovery. For
+# streaming, httpx applies this per-chunk read, so a healthy stream is never cut
+# short; only a genuine stall (no bytes for the whole window) trips it. Override
+# via GEMINI_REQUEST_TIMEOUT_MS.
+_DEFAULT_REQUEST_TIMEOUT_MS = int(os.environ.get("GEMINI_REQUEST_TIMEOUT_MS", "120000"))
 
 
 def _json_safe(value: Any) -> Any:
@@ -114,7 +123,13 @@ class GeminiProvider:
         client: genai.Client | None = None,
         project_id: str | None = None,
         location: str | None = None,
+        request_timeout_ms: int | None = None,
     ) -> None:
+        self._request_timeout_ms = (
+            request_timeout_ms
+            if request_timeout_ms is not None
+            else _DEFAULT_REQUEST_TIMEOUT_MS
+        )
         if client is not None:
             self._client = client
         else:
@@ -147,11 +162,13 @@ class GeminiProvider:
         tool_schemas: Any | None = None,
         cache_config: dict | None = None,
     ) -> tuple[list[Any], Any]:
+        http_options = types.HttpOptions(timeout=self._request_timeout_ms)
         if cache_config and cache_config.get("cache_name"):
             config = types.GenerateContentConfig(
                 cached_content=cache_config["cache_name"],
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
+                http_options=http_options,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
                     disable=True
                 ),
@@ -164,6 +181,7 @@ class GeminiProvider:
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
                 tools=tool_schemas if tool_schemas else None,
+                http_options=http_options,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
                     disable=True
                 ),
@@ -574,7 +592,34 @@ class GeminiProvider:
     # ------------------------------------------------------------------
 
     def is_retryable_error(self, error: Exception) -> bool:
-        return isinstance(error, ClientError) and error.code == 429
+        """Whether a failed generate call should be retried.
+
+        Covers the transient failures seen when the model ingests large
+        multimodal payloads (e.g. a PDF): 429 rate limits, 5xx server errors,
+        and transport-level timeouts / connection drops. The last group matters
+        most — with a per-request timeout set, a stalled stream now raises an
+        ``httpx.TimeoutException`` here instead of hanging forever, and marking
+        it retryable lets the run recover on its own instead of silently dying.
+        Inference is idempotent, so retrying is safe.
+        """
+        # 429 rate limits.
+        if isinstance(error, ClientError) and getattr(error, "code", None) == 429:
+            return True
+        # 5xx server errors (500/502/503/504).
+        if isinstance(error, ServerError):
+            return True
+        # Transport timeouts / connection drops — httpx raises these raw (the
+        # SDK only wraps HTTP status responses), so a per-request-timeout stall
+        # surfaces as one of these.
+        try:
+            import httpx
+
+            if isinstance(error, (httpx.TimeoutException, httpx.TransportError)):
+                return True
+        except ImportError:
+            pass
+        code = getattr(error, "code", None)
+        return isinstance(code, int) and code in (500, 502, 503, 504)
 
     def get_retry_delay(
         self,
