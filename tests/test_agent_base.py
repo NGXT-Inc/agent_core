@@ -1728,3 +1728,77 @@ class TestCompaction:
         ]
         assert mock_client.models.generate_content.call_count == 3
         agent.close()
+
+
+class TestEmptyResponseRetry:
+    """Empty final responses (no text, no tool calls) must retry, then raise."""
+
+    def _fast_agent(self, Agent):
+        agent = Agent()
+        agent.RETRY_BASE_DELAY = 0.01  # keep backoff out of test wall-clock
+        return agent
+
+    def test_empty_then_text_recovers(self, mock_env, mock_genai):
+        """A single empty flake should be retried and the retry's text returned."""
+        from agent_core.agents.base import Agent
+        from tests.conftest import make_empty_response
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.side_effect = [
+            make_empty_response(),
+            make_text_response("Recovered answer."),
+        ]
+
+        agent = self._fast_agent(Agent)
+        result = agent.run("hello")
+
+        assert result == "Recovered answer."
+        assert mock_client.models.generate_content.call_count == 2
+        agent.close()
+
+    def test_persistent_empty_raises(self, mock_env, mock_genai):
+        """Exhausting the empty-response budget should raise, not return ''."""
+        from agent_core.agents.base import Agent, EmptyModelResponseError
+        from tests.conftest import make_empty_response
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.side_effect = [
+            make_empty_response() for _ in range(10)
+        ]
+
+        agent = self._fast_agent(Agent)
+        with pytest.raises(EmptyModelResponseError, match="finish_reason"):
+            agent.run("hello")
+
+        # Initial call + EMPTY_RESPONSE_MAX_RETRIES retries
+        assert (
+            mock_client.models.generate_content.call_count
+            == 1 + Agent.EMPTY_RESPONSE_MAX_RETRIES
+        )
+        agent.close()
+
+    def test_empty_between_tool_calls_resets_budget(self, mock_env, mock_genai):
+        """A tool-calling response resets the consecutive-empty counter."""
+        from agent_core.agents.base import Agent
+        from tests.conftest import make_empty_response
+
+        mock_client = mock_genai.Client.return_value
+        mock_client.models.generate_content.side_effect = [
+            make_empty_response(),
+            make_tool_call_response("ping", {}),
+            make_empty_response(),
+            make_text_response("Done."),
+        ]
+
+        agent = self._fast_agent(Agent)
+
+        def ping() -> str:
+            """Ping tool."""
+            return "pong"
+
+        agent.register_tool(ping)
+        result = agent.run("go")
+
+        assert result == "Done."
+        assert mock_client.models.generate_content.call_count == 4
+        agent.close()

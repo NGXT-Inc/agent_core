@@ -166,6 +166,11 @@ def make_multi_tool_call_response(calls: list[tuple[str, dict]]) -> MockResponse
     return MockResponse("", content)
 
 
+def make_empty_response() -> MockResponse:
+    """The Gemini empty-candidate flake: 200 OK, no candidates, no text."""
+    return MockResponse("", None)
+
+
 # --- Fixtures ---
 
 

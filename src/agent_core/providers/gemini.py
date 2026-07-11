@@ -83,9 +83,27 @@ def _tool_attachment_to_file_part(value: dict) -> FilePart:
     )
 
 
+def _extract_finish_reason(response: Any) -> str | None:
+    """Best-effort finish reason as a plain string (e.g. ``"STOP"``).
+
+    Diagnostic only — an empty response with ``MAX_TOKENS`` / ``SAFETY`` is
+    indistinguishable from a normal stop without this.
+    """
+    reason = None
+    candidates = getattr(response, "candidates", None)
+    if candidates:
+        reason = getattr(candidates[0], "finish_reason", None)
+    if reason is None:
+        reason = getattr(response, "finish_reason", None)
+    if reason is None:
+        return None
+    return getattr(reason, "name", None) or str(reason)
+
+
 @dataclass(slots=True)
 class _StreamCandidate:
     content: Any
+    finish_reason: Any = None
 
 
 class _StreamedGenerateContentResponse:
@@ -97,9 +115,21 @@ class _StreamedGenerateContentResponse:
     unchanged.
     """
 
-    def __init__(self, *, text: str, content: Any | None, usage_metadata: Any):
+    def __init__(
+        self,
+        *,
+        text: str,
+        content: Any | None,
+        usage_metadata: Any,
+        finish_reason: Any = None,
+    ):
         self._text = text
-        self.candidates = [_StreamCandidate(content)] if content is not None else []
+        self.candidates = (
+            [_StreamCandidate(content, finish_reason)] if content is not None else []
+        )
+        # Kept on the response too so an empty stream (no content parts, hence
+        # no candidates) still surfaces why the model stopped.
+        self.finish_reason = finish_reason
         self.usage_metadata = usage_metadata
         self._agent_core_streamed_text = bool(text)
 
@@ -240,6 +270,7 @@ class GeminiProvider:
         role = "model"
         usage_metadata = None
         emitted_text = False
+        finish_reason = None
 
         def flush_text_buffer() -> None:
             if not text_buffer:
@@ -263,6 +294,9 @@ class GeminiProvider:
                         on_text_delta(delta)
                         emitted_text = True
                 continue
+
+            if getattr(candidates[0], "finish_reason", None) is not None:
+                finish_reason = candidates[0].finish_reason
 
             content = getattr(candidates[0], "content", None)
             if content is None:
@@ -289,6 +323,7 @@ class GeminiProvider:
             text=text,
             content=content,
             usage_metadata=usage_metadata,
+            finish_reason=finish_reason,
         )
         response._agent_core_streamed_text = emitted_text
         return response
@@ -302,6 +337,8 @@ class GeminiProvider:
             usage.completion_tokens = getattr(meta, "candidates_token_count", 0) or 0
             usage.cached_tokens = getattr(meta, "cached_content_token_count", 0) or 0
 
+        finish_reason = _extract_finish_reason(response)
+
         # Empty response
         if not response.candidates or not response.candidates[0].content:
             text = response.text or ""
@@ -312,6 +349,7 @@ class GeminiProvider:
                 usage=usage,
                 streamed_text=bool(getattr(response, "_agent_core_streamed_text", False)),
                 output_parts=[TextOutputPart(text)] if text else [],
+                finish_reason=finish_reason,
             )
 
         model_content = response.candidates[0].content
@@ -389,6 +427,7 @@ class GeminiProvider:
             thinking_text=thinking_text,
             streamed_text=bool(getattr(response, "_agent_core_streamed_text", False)),
             output_parts=[] if tool_calls else output_parts,
+            finish_reason=finish_reason,
         )
 
     # ------------------------------------------------------------------

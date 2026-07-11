@@ -370,6 +370,7 @@ class ParsedResponse:
     thinking_text: str | None = None
     streamed_text: bool = False
     output_parts: list[OutputPart] = field(default_factory=list)
+    finish_reason: str | None = None
 
 
 @runtime_checkable

@@ -102,6 +102,16 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+class EmptyModelResponseError(RuntimeError):
+    """The model repeatedly returned a response with no text and no tool calls.
+
+    Gemini occasionally answers 200 OK with an empty candidate list — most
+    often on the final (no-tool-call) turn. Accepting that as the run's answer
+    produces a silent empty result downstream, so the loop retries and raises
+    this once the retry budget is exhausted.
+    """
+
+
 def generate_instance_id(
     agent_type: str,
     session_id: str | None = None,
@@ -1395,6 +1405,12 @@ class Agent:
     RETRY_BASE_DELAY: ClassVar[float] = 2.0   # seconds
     RETRY_MAX_DELAY: ClassVar[float] = 60.0    # seconds
 
+    # Retries for well-formed responses that carry neither text nor tool calls
+    # (Gemini's empty-candidate flake). These are not exceptions, so
+    # _generate_with_retry never sees them — the function loop retries instead
+    # and raises EmptyModelResponseError once this budget is spent.
+    EMPTY_RESPONSE_MAX_RETRIES: ClassVar[int] = 3
+
     def _generate_with_retry(
         self,
         *,
@@ -1459,6 +1475,7 @@ class Agent:
             on_text_delta: Optional callback for provider text deltas.
         """
         iteration = 0
+        empty_responses = 0
         total = TokenUsage()
         last_prompt = 0
         safe_on_text_delta = None
@@ -1604,6 +1621,39 @@ class Agent:
                     )
 
             if not parsed.tool_calls:
+                # Empty final response (no text, no non-text parts): Gemini
+                # sometimes returns 200 with an empty candidate list. Retry
+                # instead of accepting it as the answer; raise once the
+                # budget is spent so callers see a failure, not "".
+                has_text = bool((parsed.text or "").strip())
+                has_non_text_parts = any(
+                    not isinstance(part, TextOutputPart)
+                    for part in parsed.output_parts
+                )
+                if not has_text and not has_non_text_parts:
+                    empty_responses += 1
+                    finish = parsed.finish_reason or "unknown"
+                    if empty_responses <= self.EMPTY_RESPONSE_MAX_RETRIES:
+                        delay = min(
+                            self.RETRY_BASE_DELAY * (2 ** (empty_responses - 1)),
+                            self.RETRY_MAX_DELAY,
+                        )
+                        logger.warning(
+                            "[%s] Empty model response (no text, no tool calls,"
+                            " finish_reason=%s); retrying (%d/%d) in %.1fs",
+                            self.name, finish, empty_responses,
+                            self.EMPTY_RESPONSE_MAX_RETRIES, delay,
+                        )
+                        if self._cancel_event.wait(timeout=delay):
+                            return "[Cancelled]", _usage_dict()
+                        iteration -= 1  # don't burn the iteration budget
+                        continue
+                    raise EmptyModelResponseError(
+                        f"Model returned an empty response {empty_responses} times"
+                        f" in a row (no text, no tool calls,"
+                        f" finish_reason={finish})"
+                    )
+
                 # Final text response
                 if parsed.raw_message is not None:
                     contents.append(parsed.raw_message)
@@ -1618,6 +1668,10 @@ class Agent:
                     token_usage=usage,
                 )
                 return self._last_response.text, usage
+
+            # A tool-calling response is progress — reset the empty-response
+            # budget so it only counts consecutive empties.
+            empty_responses = 0
 
             # Append the model's tool-calling message
             if parsed.raw_message is not None:
