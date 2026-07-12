@@ -196,6 +196,34 @@ class TestOpenAISchemaGeneration:
         props = schema["function"]["parameters"]["properties"]
         assert props["default"]["type"] == "string"
 
+    def test_pep604_optional_type_hint(self):
+        from agent_core.providers._openai_schema import callable_to_openai_tool
+
+        def search(year_min: int | None = None) -> list:
+            """Search by year."""
+            return []
+
+        schema = callable_to_openai_tool(search)
+        params = schema["function"]["parameters"]
+        assert params["properties"]["year_min"]["type"] == "integer"
+        assert "year_min" not in params.get("required", [])
+
+    def test_pep604_multi_type_hint(self):
+        from agent_core.providers._openai_schema import callable_to_openai_tool
+
+        def search(query: str | list[str]) -> list:
+            """Search one or more queries."""
+            return []
+
+        schema = callable_to_openai_tool(search)
+        query_schema = schema["function"]["parameters"]["properties"]["query"]
+        assert query_schema == {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+            ]
+        }
+
     def test_no_docstring(self):
         from agent_core.providers._openai_schema import callable_to_openai_tool
 

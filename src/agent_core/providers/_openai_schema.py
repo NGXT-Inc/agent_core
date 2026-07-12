@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import inspect
 import re
+import types
 import typing
-from typing import Any, Callable, get_type_hints
+from typing import Any, Callable, get_args, get_origin, get_type_hints
 
 
 def callable_to_openai_tool(func: Callable) -> dict:
@@ -67,7 +68,7 @@ def callable_to_openai_tool(func: Callable) -> dict:
 
 def _python_type_to_json_schema(hint: Any) -> dict:
     """Convert a Python type hint to a JSON Schema dict."""
-    origin = getattr(hint, "__origin__", None)
+    origin = get_origin(hint)
 
     if hint is str:
         return {"type": "string"}
@@ -86,12 +87,19 @@ def _python_type_to_json_schema(hint: Any) -> dict:
     if origin is dict:
         return {"type": "object"}
 
-    if origin is typing.Union:
-        # Optional[X] = Union[X, None]
-        non_none = [a for a in hint.__args__ if a is not type(None)]
+    if origin in (typing.Union, types.UnionType):
+        # Optional[X] / X | None: omission is already represented by the
+        # parameter not being required, so expose the concrete type to the
+        # model.  PEP 604 unions use ``types.UnionType`` rather than
+        # ``typing.Union`` and must be handled explicitly.
+        non_none = [a for a in get_args(hint) if a is not type(None)]
         if len(non_none) == 1:
             return _python_type_to_json_schema(non_none[0])
-        return {"type": "string"}
+        if non_none:
+            return {
+                "anyOf": [_python_type_to_json_schema(item) for item in non_none]
+            }
+        return {"type": "null"}
 
     # Fallback
     return {"type": "string"}
